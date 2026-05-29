@@ -4,342 +4,24 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>片刻 · 智能选片助手</title>
-<style>
-:root {
-  --bg: #f5f2ea;
-  --bg-card: #fbf9f3;
-  --bg-hover: #efeadd;
-  --ink: #14110d;
-  --ink-2: #2c2823;
-  --ink-muted: #6b6256;
-  --ink-faint: #9a9080;
-  --line: #d8d0bf;
-  --line-soft: #e2dccc;
-  --accent: #cc785c;
-  --accent-deep: #b25c41;
-  --accent-soft: #f4ddcf;
-  --accent-glow: rgba(204,120,92,0.16);
-  --good: #506b4f;
-  --good-soft: #cfd9c8;
-  --warn: #b97400;
-  --warn-soft: #f3e3c2;
-  --font-serif: "Iowan Old Style", "Source Serif Pro", "Charter", "Palatino", "Songti SC", Georgia, serif;
-  --font-sans: -apple-system, BlinkMacSystemFont, "Inter", "PingFang SC", "Helvetica Neue", sans-serif;
-  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  --shadow-sm: 0 1px 1px rgba(20,17,13,0.04), 0 1px 2px rgba(20,17,13,0.05);
-  --shadow-md: 0 4px 14px rgba(20,17,13,0.07), 0 2px 4px rgba(20,17,13,0.04);
-  --ease: cubic-bezier(.2, .8, .2, 1);
-}
-
-* { margin: 0; padding: 0; box-sizing: border-box; }
-
-body {
-  background: var(--bg);
-  color: var(--ink);
-  font-family: var(--font-sans);
-  font-size: 15px;
-  line-height: 1.55;
-  min-height: 100vh;
-  display: flex;
-  justify-content: center;
-  padding: 60px 40px;
-  -webkit-font-smoothing: antialiased;
-}
-
-/* Subtle noise texture overlay */
-body::before {
-  content: '';
-  position: fixed;
-  inset: 0;
-  opacity: 0.04;
-  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
-  pointer-events: none;
-  z-index: 0;
-}
-
-.shell {
-  position: relative;
-  z-index: 1;
-  width: 100%;
-  max-width: 580px;
-}
-
-/* Brand */
-.brand {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 48px;
-}
-.brand-mark {
-  width: 36px; height: 36px; border-radius: 50%;
-  background: radial-gradient(circle at 40% 35%, #f0c4b0, #cc785c 55%, #a44d35);
-  box-shadow: inset 0 1px 0 rgba(255,255,255,0.3), inset 0 -2px 3px rgba(0,0,0,0.1), 0 2px 8px rgba(204,120,92,0.22);
-  flex-shrink: 0;
-  position: relative;
-}
-.brand-mark::after {
-  content: '';
-  position: absolute;
-  inset: 7px;
-  border-radius: 50%;
-  border: 1.5px solid rgba(255,255,255,0.45);
-  border-top-color: transparent;
-  border-right-color: transparent;
-  transform: rotate(-30deg);
-}
-.brand-text {
-  font-family: var(--font-serif);
-  font-size: 26px;
-  letter-spacing: 0.22em;
-  color: var(--ink);
-  line-height: 1;
-}
-
-/* Hero */
-.hero { margin-bottom: 40px; }
-.hero h1 {
-  font-family: var(--font-serif);
-  font-size: clamp(28px, 4vw, 42px);
-  font-weight: 400;
-  line-height: 1.12;
-  color: var(--ink);
-  letter-spacing: -0.014em;
-}
-.hero h1 em {
-  font-style: italic;
-  color: var(--accent-deep);
-}
-.hero .sub {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-  color: var(--ink-muted);
-  margin-bottom: 12px;
-}
-
-/* Cards */
-.card {
-  background: var(--bg-card);
-  border: 1px solid var(--line-soft);
-  border-radius: 14px;
-  padding: 24px;
-  margin-bottom: 14px;
-  box-shadow: var(--shadow-sm);
-}
-.card-row {
-  display: flex;
-  gap: 24px;
-  flex-wrap: wrap;
-  font-size: 13px;
-}
-.card-row .item {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  letter-spacing: 0.04em;
-  color: var(--ink-muted);
-}
-.card-row .item b {
-  color: var(--ink);
-  font-weight: 500;
-}
-.status-ok  { color: var(--good) !important; }
-.status-warn { color: var(--warn) !important; }
-.status-err  { color: var(--accent) !important; }
-
-/* Mode list */
-.mode-label-row {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: var(--ink-muted);
-  margin-bottom: 14px;
-}
-.mode-list { display: flex; flex-direction: column; gap: 10px; }
-.mode-card {
-  background: var(--bg-card);
-  border: 1px solid var(--line-soft);
-  border-radius: 12px;
-  padding: 16px 18px;
-  cursor: pointer;
-  transition: border-color 0.22s var(--ease), box-shadow 0.22s var(--ease);
-  display: flex;
-  align-items: flex-start;
-  gap: 12px;
-}
-.mode-card:hover { border-color: var(--accent); box-shadow: var(--shadow-md); }
-.mode-card.active { border-color: var(--accent); background: var(--accent-soft); }
-.mode-card input[type="checkbox"],
-.mode-card input[type="radio"] {
-  accent-color: var(--accent);
-  width: 16px; height: 16px;
-  margin-top: 1px;
-  flex-shrink: 0;
-  cursor: pointer;
-}
-.mode-title {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--ink);
-  margin-bottom: 2px;
-}
-.mode-desc {
-  font-size: 12px;
-  color: var(--ink-muted);
-  line-height: 1.45;
-}
-.mode-meta {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  letter-spacing: 0.04em;
-  color: var(--ink-faint);
-  margin-top: 4px;
-}
-
-/* Buttons */
-.btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  background: var(--accent);
-  color: #fff;
-  border: none;
-  border-radius: 999px;
-  padding: 11px 28px;
-  font-family: var(--font-sans);
-  font-size: 14px;
-  font-weight: 500;
-  cursor: pointer;
-  letter-spacing: 0.01em;
-  box-shadow: 0 1px 2px rgba(20,17,13,0.2);
-  transition: background 0.18s var(--ease), box-shadow 0.18s var(--ease), transform 0.18s var(--ease);
-  margin-top: 18px;
-}
-.btn:hover { background: var(--accent-deep); box-shadow: var(--shadow-md); transform: translateY(-1px); }
-.btn:active { transform: translateY(0); }
-.btn:disabled { background: var(--ink-faint); box-shadow: none; cursor: not-allowed; transform: none; }
-
-/* Progress / Log */
-.progress-card { display: none; }
-.log-header {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: var(--ink-muted);
-  margin-bottom: 12px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.log-view {
-  background: #0a0a0a;
-  border: 1px solid #1f2937;
-  border-radius: 10px;
-  padding: 14px 16px;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  line-height: 1.6;
-  max-height: 280px;
-  overflow-y: auto;
-  color: #d1d5db;
-  white-space: pre-wrap;
-}
-.log-status { color: #e29274; }
-.log-error  { color: #f87171; }
-
-/* Spinner */
-.spinner {
-  display: inline-block;
-  width: 16px; height: 16px;
-  border: 2px solid var(--line);
-  border-top-color: var(--accent);
-  border-radius: 50%;
-  animation: spin 0.8s linear infinite;
-  vertical-align: middle;
-}
-@keyframes spin { to { transform: rotate(360deg); } }
-
-/* Status lines in loading card */
-.loading-text {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  letter-spacing: 0.04em;
-  color: var(--ink-muted);
-}
-
-/* Pulse dot */
-.dot-pulse {
-  width: 8px; height: 8px;
-  border-radius: 50%;
-  background: var(--accent);
-  display: inline-block;
-  animation: pulse 1.4s ease infinite;
-}
-@keyframes pulse {
-  0%, 100% { opacity: 0.35; }
-  50% { opacity: 1; }
-}
-</style>
+<link rel="stylesheet" href="css/style.css">
 </head>
 <body>
 <div class="shell">
 
-  <!-- Brand -->
   <div class="brand">
     <div class="brand-mark"></div>
     <div class="brand-text">片刻</div>
   </div>
 
-  <!-- Hero -->
-  <div class="hero" id="hero-block">
-    <div class="sub" id="hero-label">环境检测</div>
-    <h1 id="hero-title">正在准备<em>运行环境</em></h1>
+  <div class="hero">
+    <div class="sub">环境检测</div>
+    <h1>正在准备<em>运行环境</em></h1>
   </div>
 
-  <!-- Loading -->
-  <div class="card" id="loading-card">
+  <div class="card">
     <span class="spinner"></span>
-    <span class="loading-text" id="loading-msg">正在检查环境...</span>
-  </div>
-
-  <!-- Env info (hidden initially) -->
-  <div class="card" id="env-card" style="display:none;"></div>
-
-  <!-- Mode selection (hidden initially) -->
-  <div class="card" id="mode-card" style="display:none;">
-    <div class="mode-label-row">选择功能模式</div>
-    <div class="mode-list" id="mode-list"></div>
-    <div class="mode-label-row" style="margin-top:18px;">运行时设备偏好</div>
-    <div class="mode-list" id="runtime-list">
-      <label class="mode-card active">
-        <input type="radio" name="runtime" value="auto" checked onchange="onRuntimeChange(this)">
-        <div>
-          <div class="mode-title">auto · 自动</div>
-          <div class="mode-desc">检测到可用 GPU 就优先用，否则用 CPU</div>
-        </div></label>
-      <label class="mode-card">
-        <input type="radio" name="runtime" value="cpu" onchange="onRuntimeChange(this)">
-        <div>
-          <div class="mode-title">cpu · 仅 CPU</div>
-          <div class="mode-desc">只用 CPU 推理，不安装 CUDA 依赖（省约 2GB 下载）</div>
-        </div></label>
-      <label class="mode-card">
-        <input type="radio" name="runtime" value="gpu" onchange="onRuntimeChange(this)">
-        <div>
-          <div class="mode-title">gpu · 强制 GPU</div>
-          <div class="mode-desc">强制使用 GPU，没有可用 GPU 就报错</div>
-        </div></label>
-    </div>
-    <button class="btn" id="btn-start">开始安装</button>
-  </div>
-
-  <!-- Progress (hidden initially) -->
-  <div class="card progress-card" id="progress-card">
-    <div class="log-header"><span class="dot-pulse" id="prog-dot"></span><span id="prog-title">正在安装...</span></div>
-    <div class="log-view" id="log"></div>
+    <span class="loading-text" id="status">正在检查环境...</span>
   </div>
 
 </div>
@@ -349,166 +31,45 @@ body::before {
   'use strict';
   var invoke = window.__TAURI_INTERNALS__.invoke;
   var eventApi = window.__TAURI__ && window.__TAURI__.event;
+  var $status = document.getElementById('status');
 
-  // 先让窗口和页面渲染出来，再把 init_setup 放到下一帧执行，
-  // 确保用户先看到加载 spinner，不被 init_setup 的耗时操作阻塞首帧。
+  // 监听后台事件，实时更新加载文字
+  if (eventApi) {
+    eventApi.listen('setup:status', function(e) {
+      $status.textContent = e.payload;
+    }).catch(function(){});
+  }
+
+  // 页面渲染后显示窗口
   invoke('show_window').catch(function(){});
 
-  function $(id) { return document.getElementById(id); }
-
-  function log(msg, cls) {
-    var el = $('log');
-    var line = document.createElement('div');
-    line.className = cls || '';
-    line.textContent = msg;
-    el.appendChild(line);
-    el.scrollTop = el.scrollHeight;
-  }
-
-  function show(id) { $(id).style.display = 'block'; }
-  function hide(id) { $(id).style.display = 'none'; }
-
-  var flaskUrl = null;
-
-  var listenersReady = Promise.resolve();
-  if (eventApi) {
-    listenersReady = Promise.all([
-      eventApi.listen('setup:status',   function(e) { log(e.payload, 'log-status'); }),
-      eventApi.listen('setup:progress', function(e) { log(e.payload); }),
-      eventApi.listen('setup:error',    function(e) { log(e.payload, 'log-error'); $('prog-dot').style.display = 'none'; }),
-      eventApi.listen('setup:ready',    function(e) { flaskUrl = e.payload; })
-    ]).catch(function(){});
-  }
-
-  // 等到首帧渲染后再启动 init_setup，避免阻塞页面显示
-  function initAfterPaint() {
+  // 等到首帧渲染后启动 init_setup
+  function startInit() {
     invoke('init_setup').then(function(r) {
-      hide('loading-card');
-
-      // Auto-start: skip env-card, go directly to progress
       if (r.auto_start_modes && r.auto_start_modes.length > 0) {
-        doStartSetup(r.auto_start_modes, r.auto_start_runtime || 'auto');
+        // 已安装，直接跳到安装/启动页
+        var params = '?modes=' + encodeURIComponent(r.auto_start_modes.join(',')) +
+                     '&runtime=' + encodeURIComponent(r.auto_start_runtime || 'auto');
+        window.location.href = 'progress.html' + params;
         return;
       }
 
-      // Normal flow: render env-card
-      var parts = [];
-      if (r.python_version) {
-        parts.push('<div class="card-row">' +
-          '<div class="item">Python <b class="status-ok">' + r.python_version + '</b></div>' +
-          '<div class="item">可用磁盘 <b>' + r.disk_free_gb.toFixed(1) + ' GB</b></div>' +
-          '<div class="item">内存 <b>' + r.memory_gb.toFixed(1) + ' GB</b></div>' +
-          '</div>');
-      }
-      if (r.warnings.length) {
-        r.warnings.forEach(function(w) { parts.push('<div class="item status-warn" style="margin-top:6px;">⚠ ' + w + '</div>'); });
-      }
-      if (r.errors.length) {
-        r.errors.forEach(function(e) { parts.push('<div class="item status-err" style="margin-top:6px;">✕ ' + e + '</div>'); });
-      }
-      if (r.status_msgs.length) {
-        parts.push('<div style="margin-top:10px;font-size:11px;color:var(--ink-faint);font-family:var(--font-mono);">');
-        r.status_msgs.forEach(function(m) { parts.push('· ' + m + '<br>'); });
-        parts.push('</div>');
-      }
-      $('env-card').innerHTML = parts.join('');
-      show('env-card');
-
-      if (r.errors.length) {
-        $('hero-title').innerHTML = '环境存在<em>问题</em>';
-        $('hero-label').textContent = '检测结果';
-      } else if (!r.python_version) {
-        $('hero-title').innerHTML = '需要安装<em>Python</em>';
-        $('hero-label').textContent = '检测结果';
-      } else {
-        $('hero-title').innerHTML = '环境<em>就绪</em>';
-        $('hero-label').textContent = '检测结果';
-      }
-
-      return invoke('get_modes');
-    }).then(function(modes) {
-      if (!modes) return;
-      var html = '';
-      modes.forEach(function(m) {
-        html += '<label class="mode-card' + (m.selected ? ' active' : '') + '">' +
-          '<input type="checkbox" value="' + m.key + '"' + (m.selected ? ' checked' : '') +
-          ' onchange="this.parentElement.classList.toggle(\'active\', this.checked)">' +
-          '<div>' +
-          '<div class="mode-title">' + m.label + '</div>' +
-          '<div class="mode-desc">' + m.description + '</div>' +
-          '<div class="mode-meta">' + m.download_size + ' · ' + m.time_estimate + '</div>' +
-          '</div></label>';
-      });
-      $('mode-list').innerHTML = html;
-      show('mode-card');
-      $('hero-title').innerHTML = '选择<em>功能模式</em>';
-      $('hero-label').textContent = '安装配置';
+      // 未安装，跳转到环境信息页
+      var params = '?p=' + encodeURIComponent(r.python_version || '') +
+                   '&d=' + r.disk_free_gb.toFixed(1) +
+                   '&m=' + r.memory_gb.toFixed(1) +
+                   '&w=' + encodeURIComponent(r.warnings.join('|')) +
+                   '&e=' + encodeURIComponent(r.errors.join('|')) +
+                   '&s=' + encodeURIComponent(r.status_msgs.join('|'));
+      window.location.href = 'env.html' + params;
     }).catch(function(e) {
-      hide('loading-card');
-      $('env-card').innerHTML = '<div class="item status-err">初始化失败: ' + JSON.stringify(e).substring(0,200) + '</div>';
-      show('env-card');
-      $('hero-title').innerHTML = '初始化<em>失败</em>';
+      $status.textContent = '初始化失败: ' + JSON.stringify(e).substring(0, 100);
     });
   }
 
-  // 双 rAF 确保浏览器完成首帧绘制后再启动检测
   requestAnimationFrame(function() {
-    requestAnimationFrame(initAfterPaint);
+    requestAnimationFrame(startInit);
   });
-
-  function doStartSetup(modes, runtime) {
-    hide('env-card');
-    hide('mode-card');
-    hide('hero-block');
-    show('progress-card');
-    $('prog-title').textContent = '正在启动服务...';
-    runtime = runtime || 'auto';
-
-    listenersReady.then(function() {
-      invoke('start_setup', { modes: modes, runtime: runtime }).catch(function(e) {
-        log('启动失败: ' + e, 'log-error');
-        $('prog-dot').style.display = 'none';
-      });
-    });
-
-    // Poll Flask, navigate when it responds (keeps progress card visible)
-    var count = 0;
-    var url = 'http://localhost:5057';
-    var timer = setInterval(function() {
-      if (++count > 120) { clearInterval(timer); return; }
-      var xhr = new XMLHttpRequest();
-      xhr.open('GET', url, true);
-      xhr.timeout = 1000;
-      xhr.onload = function() {
-        if (xhr.status > 0) {
-          clearInterval(timer);
-          log('服务已就绪', 'log-status');
-          var target = flaskUrl || url;
-          invoke('navigate_to_flask', { url: target }).catch(function(){});
-        }
-      };
-      xhr.onerror = function(){};
-      xhr.ontimeout = function(){};
-      try { xhr.send(); } catch(e) {}
-    }, 500);
-  }
-
-  $('btn-start').addEventListener('click', function() {
-    var checks = document.querySelectorAll('#mode-list input[type=checkbox]:checked');
-    var modes = [];
-    checks.forEach(function(c) { modes.push(c.value); });
-    if (modes.length === 0) { alert('请至少选择一个模式'); return; }
-    var runtimeRadio = document.querySelector('input[name=runtime]:checked');
-    var runtime = runtimeRadio ? runtimeRadio.value : 'auto';
-    doStartSetup(modes, runtime);
-  });
-
-  window.onRuntimeChange = function(el) {
-    document.querySelectorAll('#runtime-list .mode-card').forEach(function(card) {
-      card.classList.remove('active');
-    });
-    el.parentElement.classList.add('active');
-  };
 })();
 </script>
 </body>

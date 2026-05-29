@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="zh-CN" style="background:#f5f2ea">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>片刻 · 安装中</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="shell">
+
+  <div class="brand">
+    <div class="brand-mark"></div>
+    <div class="brand-text">片刻</div>
+  </div>
+
+  <div class="card">
+    <div class="log-header">
+      <span class="dot-pulse" id="prog-dot"></span>
+      <span id="prog-title">正在启动服务...</span>
+    </div>
+    <div class="log-view" id="log"></div>
+    <div class="loading-text" id="status-msg" style="margin-top:10px;"></div>
+  </div>
+
+</div>
+
+<script>
+(function() {
+  'use strict';
+  var invoke = window.__TAURI_INTERNALS__.invoke;
+  var eventApi = window.__TAURI__ && window.__TAURI__.event;
+
+  function $(id) { return document.getElementById(id); }
+
+  function log(msg, cls) {
+    var el = $('log');
+    var line = document.createElement('div');
+    line.className = cls || '';
+    line.textContent = msg;
+    el.appendChild(line);
+    el.scrollTop = el.scrollHeight;
+  }
+
+  // 解析 URL 参数
+  var params = new URLSearchParams(window.location.search);
+  var modes = (params.get('modes') || '').split(',').filter(Boolean);
+  var runtime = params.get('runtime') || 'auto';
+
+  if (modes.length === 0) {
+    log('未指定安装模式，请返回重新选择', 'log-error');
+    $('prog-dot').style.display = 'none';
+  } else {
+    var flaskUrl = null;
+
+    // 监听后台事件
+    var listenersReady = Promise.resolve();
+    if (eventApi) {
+      listenersReady = Promise.all([
+        eventApi.listen('setup:status',   function(e) { log(e.payload, 'log-status'); }),
+        eventApi.listen('setup:progress', function(e) { log(e.payload); }),
+        eventApi.listen('setup:error',    function(e) { log(e.payload, 'log-error'); $('prog-dot').style.display = 'none'; }),
+        eventApi.listen('setup:ready',    function(e) { flaskUrl = e.payload; })
+      ]).catch(function(){});
+    }
+
+    // 启动安装
+    listenersReady.then(function() {
+      invoke('start_setup', { modes: modes, runtime: runtime }).catch(function(e) {
+        log('启动失败: ' + e, 'log-error');
+        $('prog-dot').style.display = 'none';
+      });
+    });
+
+    // 轮询 Flask，就绪后跳转（作为 Rust 侧 navigate 的兜底）
+    var count = 0;
+    var pollUrl = 'http://localhost:5057';
+    var timer = setInterval(function() {
+      if (++count > 120) { clearInterval(timer); return; }
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', pollUrl, true);
+      xhr.timeout = 1000;
+      xhr.onload = function() {
+        if (xhr.status > 0) {
+          clearInterval(timer);
+          log('服务已就绪', 'log-status');
+          var target = flaskUrl || pollUrl;
+          invoke('navigate_to_flask', { url: target }).catch(function(){});
+        }
+      };
+      xhr.onerror = function(){};
+      xhr.ontimeout = function(){};
+      try { xhr.send(); } catch(e) {}
+    }, 500);
+  }
+})();
+</script>
+</body>
+</html>
