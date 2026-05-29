@@ -61,3 +61,7 @@ job-*.log
 
 # 内部审计 / 设计文档，不入库
 docs/
+
+# Git worktrees
+.worktrees/
+src-tauri/target/
