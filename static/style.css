@@ -403,6 +403,16 @@ code {
   color: var(--ink, #1a1a1a);
 }
 
+.landing-foot-license {
+  border-top: 1px dashed var(--line-soft, rgba(0, 0, 0, 0.08));
+  padding-top: 10px;
+  color: var(--ink-faint);
+}
+
+.landing-foot-license span:first-child {
+  color: var(--accent, #cc785c);
+}
+
 /* =========================================================
    处理进度页
    ========================================================= */

@@ -1,3 +1,18 @@
+# ⚠️ Windows + NVIDIA 显卡手动安装建议：
+#
+# 这个项目现在默认按「Windows 独显优先」来配依赖。
+# `requirements.txt` 里把 ONNX Runtime 切到了 GPU 版；但 `torch/torchvision`
+# 不能只靠这一份文件从 PyPI 装，否则很容易又装回 CPU 版。
+#
+# 推荐顺序：
+#   1) python -m pip install -r requirements.txt
+#   2) python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+#
+# 装完后验证：
+#   python -c "import torch, onnxruntime as ort; print(torch.__version__, torch.cuda.is_available(), torch.version.cuda); print(ort.get_available_providers())"
+#
+# 如果你的环境拉不下 cu128，可把上面的 `cu128` 换成 `cu126` 再试。
+#
 # ⚠️ OpenCV 注意事项（手动 pip install 走这条路径必读）：
 #
 # `insightface` 和 `pyiqa` 等会偷偷把 `opencv-python` 拉进来作传递依赖。
@@ -26,13 +41,18 @@ opencv-contrib-python>=4.9
 rawpy>=0.18
 
 # 视觉语义特征（DINOv2）+ NIMA 美学评分（MobileNetV2）
-torch>=2.2
-torchvision>=0.17
+# Windows + Python 3.11 直接锁定官方 CUDA 12.8 wheel，避免 pip 从 PyPI
+# 选到更高版本的 CPU 版 torch。
+https://download.pytorch.org/whl/cu128/torch-2.11.0%2Bcu128-cp311-cp311-win_amd64.whl ; platform_system == "Windows" and python_version == "3.11"
+https://download.pytorch.org/whl/cu128/torchvision-0.26.0%2Bcu128-cp311-cp311-win_amd64.whl ; platform_system == "Windows" and python_version == "3.11"
+torch>=2.2 ; platform_system != "Windows" or python_version != "3.11"
+torchvision>=0.17 ; platform_system != "Windows" or python_version != "3.11"
 transformers>=4.40
 
 # 人脸检测 + ArcFace 512 维嵌入（RetinaFace + ArcFace via InsightFace）
 insightface>=0.7
-onnxruntime>=1.16
+onnxruntime-gpu[cuda,cudnn]>=1.16; platform_system == "Windows"
+onnxruntime>=1.16; platform_system != "Windows"
 
 # 互补美学/质量评分（pyiqa: MUSIQ 技术质量 + CLIP-IQA+ LAION 美学）
 pyiqa>=0.1.10

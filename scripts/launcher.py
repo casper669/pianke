@@ -46,6 +46,36 @@ USE_MIRROR = os.environ.get("PIANKE_NO_MIRROR", "0") != "1"
 PYPI_MIRROR = "https://pypi.tuna.tsinghua.edu.cn/simple/"
 PYPI_MIRROR_HOST = "pypi.tuna.tsinghua.edu.cn（清华大学）"
 HF_MIRROR = "https://hf-mirror.com"  # HuggingFace 镜像（DINOv2、NIMA 等模型）
+PYTORCH_CUDA_FLAVOR = os.environ.get("PIANKE_TORCH_CUDA", "cu128")
+PYTORCH_CUDA_INDEX = os.environ.get(
+    "PIANKE_TORCH_INDEX_URL",
+    f"https://download.pytorch.org/whl/{PYTORCH_CUDA_FLAVOR}",
+)
+VISION_BASE_PACKAGES = [
+    "transformers>=4.40",
+    "insightface>=0.7",
+]
+VISION_EXPERT_PACKAGES = [
+    "pyiqa>=0.1.10",
+    "timm>=0.9",
+]
+LLM_PACKAGES = [
+    "openai>=1.40",
+]
+CPU_RUNTIME_PACKAGES = [
+    "torch>=2.2",
+    "torchvision>=0.17",
+    "onnxruntime>=1.16",
+]
+GPU_RUNTIME_PACKAGES = [
+    "torch>=2.2",
+    "torchvision>=0.17",
+    "onnxruntime-gpu[cuda,cudnn]>=1.16",
+]
+TORCH_CUDA_PACKAGES = [
+    "torch>=2.2",
+    "torchvision>=0.17",
+]
 
 # 所有模式都必装的核心包（HTTP 服务、图像读写、扫描）。
 # 不能塞进 MODE_PACKAGES["fast"]——否则"只选 expert"的用户会缺 Pillow/flask/...
@@ -69,18 +99,8 @@ CORE_PACKAGES = [
 # 每种模式在 CORE 之外额外需要的 pip 包。
 MODE_PACKAGES = {
     "fast": [],     # 极速模式所有依赖都在 CORE 里
-    "expert": [
-        "torch>=2.2",
-        "torchvision>=0.17",
-        "transformers>=4.40",
-        "insightface>=0.7",
-        "onnxruntime>=1.16",
-        "pyiqa>=0.1.10",
-        "timm>=0.9",
-    ],
-    "tycoon": [
-        "openai>=1.40",
-    ],
+    "expert": [],
+    "tycoon": [],
 }
 
 MODE_LABELS = {
@@ -139,12 +159,13 @@ def save_install(data: dict) -> None:
 # ---------- 模式选择 ----------
 
 def ask_modes(previous: list[str] | None) -> list[str]:
-    print()
+    # 已有历史配置：直接沿用，不阻塞用户。换模式靠删 .pic_selecter_install.json。
     if previous:
-        print(f"上次启用的模式：{', '.join(previous)}")
-        print("直接回车 = 沿用；否则请重新选择。")
-    else:
-        print("第一次运行，请选择要启用的模式（可多选，逗号或空格分隔）：")
+        info(f"使用上次配置的模式：{', '.join(previous)}")
+        return previous
+
+    print()
+    print("第一次运行，请选择要启用的模式（可多选，逗号或空格分隔）：")
 
     print()
     keys = ["fast", "expert", "tycoon"]
@@ -158,8 +179,6 @@ def ask_modes(previous: list[str] | None) -> list[str]:
         except EOFError:
             raw = ""
 
-        if not raw and previous:
-            return previous
         if not raw:
             print("请至少选一个。")
             continue
@@ -182,6 +201,34 @@ def ask_modes(previous: list[str] | None) -> list[str]:
             print("请至少选一个。")
             continue
         return chosen
+
+
+def ask_runtime(previous: str | None) -> str:
+    # 已有历史配置：直接沿用。
+    if previous:
+        info(f"使用上次配置的运行设备：{previous}")
+        return previous
+
+    print()
+    print("请选择本地运行时设备偏好：")
+
+    print()
+    print("  1) auto  自动（检测到可用 GPU 就优先用）")
+    print("  2) cpu   只用 CPU")
+    print("  3) gpu   强制用 GPU（没有可用 GPU 就报错）")
+
+    mapping = {"1": "auto", "2": "cpu", "3": "gpu"}
+    while True:
+        try:
+            raw = input("\n> ").strip().lower()
+        except EOFError:
+            raw = ""
+
+        if raw in {"auto", "cpu", "gpu"}:
+            return raw
+        if raw in mapping:
+            return mapping[raw]
+        print("无法识别，请输入 1/2/3 或 auto/cpu/gpu。")
 
 
 # ---------- GitHub 更新检查 ----------
@@ -221,6 +268,7 @@ PRESERVE = {
     ".venv",
     ".pic_selecter_install.json",
     ".pic_selecter_deps.stamp",
+    "models",
     "__pycache__",
     ".git",
     "pic_test",     # 开发用的测试图，可能用户也存了私货
@@ -336,13 +384,29 @@ MODE_TIME_ESTIMATE = {
 }
 
 
-def pip_install(packages: list[str]) -> None:
+def pip_install(
+    packages: list[str],
+    *,
+    index_url: str | None = None,
+    extra_index_urls: list[str] | None = None,
+    upgrade: bool = False,
+    force_reinstall: bool = False,
+) -> None:
     if not packages:
         return
     uv = have_uv()
+    extra_index_urls = list(extra_index_urls or [])
     if uv:
         cmd = [uv, "pip", "install", "--python", str(PY_IN_VENV)]
-        if USE_MIRROR:
+        if upgrade:
+            cmd.append("--upgrade")
+        if force_reinstall:
+            cmd.append("--force-reinstall")
+        if index_url:
+            cmd += ["--index-url", index_url]
+            for url in extra_index_urls:
+                cmd += ["--extra-index-url", url]
+        elif USE_MIRROR:
             # uv 用 --index-url 切镜像；同时把 PyPI 官方作为 fallback 防镜像缺包
             cmd += ["--index-url", PYPI_MIRROR,
                     "--extra-index-url", "https://pypi.org/simple/"]
@@ -350,11 +414,21 @@ def pip_install(packages: list[str]) -> None:
     else:
         cmd = [str(PY_IN_VENV), "-m", "pip", "install",
                "--disable-pip-version-check", "--no-input"]
-        if USE_MIRROR:
+        if upgrade:
+            cmd.append("--upgrade")
+        if force_reinstall:
+            cmd.append("--force-reinstall")
+        if index_url:
+            cmd += ["-i", index_url]
+            for url in extra_index_urls:
+                cmd += ["--extra-index-url", url]
+        elif USE_MIRROR:
             cmd += ["-i", PYPI_MIRROR,
                     "--extra-index-url", "https://pypi.org/simple/"]
         cmd += packages
-    if USE_MIRROR:
+    if index_url:
+        info(f"使用指定安装源：{index_url}")
+    elif USE_MIRROR:
         info(f"使用国内镜像源：{PYPI_MIRROR_HOST}")
         info("（海外用户想用 PyPI 官方源请在终端先 `export PIANKE_NO_MIRROR=1` 再启动）")
     info("接下来会看到 pip 滚动下载进度条——只要在动就是在装，不要关窗口。")
@@ -402,16 +476,72 @@ def _ensure_opencv_single() -> None:
 def packages_for_modes(modes: list[str]) -> list[str]:
     """返回 CORE + 选中模式的额外包。任何模式都会带上 CORE。"""
     seen: dict[str, None] = {pkg: None for pkg in CORE_PACKAGES}
-    for m in modes:
-        for pkg in MODE_PACKAGES[m]:
+    if any(m in {"expert", "tycoon"} for m in modes):
+        for pkg in VISION_BASE_PACKAGES:
+            seen[pkg] = None
+    if "expert" in modes:
+        for pkg in VISION_EXPERT_PACKAGES:
+            seen[pkg] = None
+    if "tycoon" in modes:
+        for pkg in LLM_PACKAGES:
             seen[pkg] = None
     return list(seen.keys())
 
 
+def wants_cuda_backend(modes: list[str], runtime: str = "auto") -> bool:
+    if not any(m in {"expert", "tycoon"} for m in modes):
+        return False
+    if os.environ.get("PIANKE_FORCE_CPU", "0") == "1":
+        return False
+    # 用户明确选了 CPU：不装 CUDA 依赖，省 2GB 下载。
+    # （runtime=gpu 仍按 nvidia-smi 探测；没卡装了也是浪费。）
+    if runtime == "cpu":
+        return False
+    return shutil.which("nvidia-smi") is not None
+
+
+def pip_uninstall(packages: list[str]) -> None:
+    if not packages:
+        return
+    subprocess.call([str(PY_IN_VENV), "-m", "pip", "uninstall", "-y", *packages])
+
+
+def ensure_runtime_backends(modes: list[str], runtime: str = "auto") -> str:
+    if not any(m in {"expert", "tycoon"} for m in modes):
+        return "none"
+    if wants_cuda_backend(modes, runtime):
+        info(f"检测到 NVIDIA GPU，安装 CUDA 版 PyTorch（{PYTORCH_CUDA_FLAVOR}）+ ONNX Runtime GPU")
+        pip_uninstall(["onnxruntime", "onnxruntime-gpu", "onnxruntime-directml", "torch", "torchvision", "torchaudio"])
+        pip_install(
+            TORCH_CUDA_PACKAGES,
+            index_url=PYTORCH_CUDA_INDEX,
+            upgrade=True,
+            force_reinstall=True,
+        )
+        pip_install(
+            ["onnxruntime-gpu[cuda,cudnn]>=1.16"],
+            index_url="https://pypi.org/simple/",
+            upgrade=True,
+            force_reinstall=True,
+        )
+        return f"cuda:{PYTORCH_CUDA_FLAVOR}"
+    info("未检测到 NVIDIA GPU，安装 CPU 版 torch / onnxruntime")
+    pip_install(
+        CPU_RUNTIME_PACKAGES,
+        upgrade=True,
+        force_reinstall=False,
+    )
+    return "cpu"
+
+
 def ensure_dependencies(modes: list[str], install: dict, force: bool) -> None:
-    """按模式列表安装依赖。已装过且模式未变则跳过。"""
+    """按模式列表安装依赖。已装过且模式/runtime 未变则跳过。"""
+    runtime = (install.get("runtime") or "auto").strip().lower()
     packages = packages_for_modes(modes)
-    sig = "|".join(sorted(packages))
+    backend_sig = "none"
+    if any(m in {"expert", "tycoon"} for m in modes):
+        backend_sig = f"vision:{'cuda' if wants_cuda_backend(modes, runtime) else 'cpu'}:{PYTORCH_CUDA_FLAVOR}"
+    sig = "|".join(sorted(packages + [backend_sig]))
     last_sig = install.get("packages_sig")
     if not force and last_sig == sig and PY_IN_VENV.exists():
         info("依赖已是最新，跳过安装")
@@ -419,9 +549,11 @@ def ensure_dependencies(modes: list[str], install: dict, force: bool) -> None:
 
     est = "、".join(f"{m}（{MODE_TIME_ESTIMATE[m]}）" for m in modes)
     info(f"准备安装 {len(packages)} 个 pip 包，预计耗时：{est}")
+    runtime_backend = ensure_runtime_backends(modes, runtime)
     pip_install(packages)
     install["packages_sig"] = sig
     install["modes"] = modes
+    install["runtime_backend"] = runtime_backend
     save_install(install)
     info("依赖安装完成 ✓")
 
@@ -431,9 +563,9 @@ def ensure_dependencies(modes: list[str], install: dict, force: bool) -> None:
 def run_app(port: int) -> int:
     info(f"启动 Flask 服务于 http://localhost:{port}")
     if "expert" in (load_install().get("modes") or []):
-        info("专家模式首次启动会加载 DINOv2/NIMA/InsightFace 模型（约 10-30 秒）...")
+        info("专家模式首次启动会加载本地辅助数据（约 10-30 秒）...")
         if USE_MIRROR:
-            info(f"使用 HuggingFace 镜像 {HF_MIRROR}（如已下载过模型则跳过）")
+            info(f"使用国内镜像加速首次下载（如已准备过则跳过）")
     print()
     print("=" * 56)
     print("  服务启动后浏览器会自动打开。")
@@ -444,7 +576,9 @@ def run_app(port: int) -> int:
     if USE_MIRROR:
         # 让 transformers / huggingface_hub 走国内镜像
         env.setdefault("HF_ENDPOINT", HF_MIRROR)
-    cmd = [str(PY_IN_VENV), "app.py", "--port", str(port)]
+    runtime = (load_install().get("runtime") or "auto").strip().lower() or "auto"
+    env["PIC_SELECTER_RUNTIME"] = runtime
+    cmd = [str(PY_IN_VENV), "app.py", "--port", str(port), "--runtime", runtime]
     try:
         return subprocess.call(cmd, cwd=str(ROOT), env=env)
     except KeyboardInterrupt:
@@ -466,17 +600,23 @@ def main() -> int:
         die(f"未找到 app.py（期望路径：{ROOT / 'app.py'}）。请确认启动器放在项目根目录。")
 
     install = load_install()
+    is_first_run = not (install.get("modes") and install.get("runtime"))
 
     # 步骤 1：检查更新
     step(1, 4, "检查 GitHub 更新")
     check_and_apply_update(install)
 
-    # 步骤 2：选择模式
-    step(2, 4, "选择运行模式")
+    # 步骤 2：选择模式 / 运行设备
+    # 已配置过的用户：直接沿用上次选择，零交互启动。想换配置请删
+    # .pic_selecter_install.json 后重新双击启动器。
+    step(2, 4, "选择运行模式" if is_first_run else "沿用上次配置")
+    if not is_first_run:
+        info("（如需重新选择模式或设备，请删除 .pic_selecter_install.json 后重启）")
     prev_modes = install.get("modes") or []
     modes = ask_modes(prev_modes)
-    info(f"本次启用：{', '.join(modes)}")
     install["modes"] = modes
+    runtime = ask_runtime(install.get("runtime"))
+    install["runtime"] = runtime
     save_install(install)
 
     # 步骤 3：venv + 依赖
