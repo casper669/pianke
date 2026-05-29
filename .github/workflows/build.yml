@@ -95,7 +95,16 @@ jobs:
         with:
           path: artifacts
           pattern: pianke-*
-          merge-multiple: true
+
+      - name: Flatten artifact directories
+        run: |
+          find artifacts -mindepth 2 -type f -exec sh -c '
+            for f; do
+              dir=$(dirname "$f" | sed "s|artifacts/[^/]*/|artifacts/|")
+              mkdir -p "$dir"
+              mv "$f" "$dir/"
+            done
+          ' _ {} +
 
       - name: List artifacts
         run: find artifacts -type f -ls
@@ -104,10 +113,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-          artifacts/dmg/*.dmg
-          artifacts/deb/*.deb
-          artifacts/rpm/*.rpm
-          artifacts/appimage/*.AppImage
-          artifacts/msi/*.msi
-          artifacts/nsis/*.exe
+            artifacts/dmg/*.dmg
+            artifacts/deb/*.deb
+            artifacts/rpm/*.rpm
+            artifacts/appimage/*.AppImage
+            artifacts/msi/*.msi
+            artifacts/nsis/*.exe
           fail_on_unmatched_files: false
