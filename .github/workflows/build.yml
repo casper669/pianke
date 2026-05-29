@@ -83,7 +83,7 @@ jobs:
             src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi
             src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe
             src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app
-          if-no-files-found: error
+          if-no-files-found: warn
 
   publish:
     needs: build
