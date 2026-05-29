@@ -90,11 +90,8 @@ pub fn init_setup(
             let _ = app.emit("setup:status", "未找到 Python，正在尝试通过 uv 安装...");
             status_msgs.push("未找到 Python，正在尝试通过 uv 安装...".into());
 
-            // 查找系统 Python 作为 uv 失败时的回退方案
-            let system_python = env_check::find_python();
-
             match PythonRuntime::setup_venv(
-                system_python.as_deref(),
+                None,
                 &state.app_data_dir,
                 true,
                 |msg| {
@@ -131,7 +128,7 @@ pub fn init_setup(
         let app2 = app.clone();
         std::thread::spawn(move || {
             updater::check_and_apply(&app_dir, &state_path2, &vp, &mut |msg: &str| {
-                let _ = app2.emit("setup:status", msg.to_string());
+                let _ = app2.emit("update:status", msg.to_string());
             });
         });
     } else {

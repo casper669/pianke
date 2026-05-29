@@ -822,8 +822,16 @@ fn create_venv(python_path: Option<&Path>, venv_dir: &Path, use_ensure_uv: bool,
     }
 
     // 回退：使用系统 Python 的标准库 venv
-    let python_path = python_path
-        .ok_or_else(|| anyhow::anyhow!("未找到系统 Python 且 uv 不可用，请安装 Python 3.10+ 或 uv"))?;
+    // 只在真正需要时才搜索系统 Python，避免每次启动都跑 find_python()
+    let found_python;
+    let python_path = if let Some(p) = python_path.filter(|p| !p.as_os_str().is_empty()) {
+        p
+    } else {
+        found_python = crate::env_check::find_python();
+        found_python.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("未找到系统 Python 且 uv 不可用，请安装 Python 3.10+ 或 uv")
+        })?
+    };
     log::info!("Falling back to system Python + venv...");
     on_progress("使用系统 Python 创建虚拟环境...");
     let status = Command::new(python_path)

@@ -15,14 +15,16 @@
   </div>
 
   <div class="hero">
-    <div class="sub">环境检测</div>
-    <h1>正在准备<em>运行环境</em></h1>
+    <div class="sub" id="hero-label">环境检测</div>
+    <h1 id="hero-title">正在准备<em>运行环境</em></h1>
   </div>
 
-  <div class="card">
-    <span class="spinner"></span>
+  <!-- 加载卡片（环境检测阶段） -->
+  <div class="card" id="loading-card">
+    <span class="spinner" id="loading-spinner"></span>
     <span class="loading-text" id="status">正在检查环境...</span>
   </div>
+
 
 </div>
 
@@ -30,31 +32,21 @@
 (function() {
   'use strict';
   var invoke = window.__TAURI_INTERNALS__.invoke;
-  var eventApi = window.__TAURI__ && window.__TAURI__.event;
-  var $status = document.getElementById('status');
-
-  // 监听后台事件，实时更新加载文字
-  if (eventApi) {
-    eventApi.listen('setup:status', function(e) {
-      $status.textContent = e.payload;
-    }).catch(function(){});
-  }
+  function $(id) { return document.getElementById(id); }
 
   // 页面渲染后显示窗口
   invoke('show_window').catch(function(){});
 
-  // 等到首帧渲染后启动 init_setup
+  // 首帧渲染后启动
   function startInit() {
     invoke('init_setup').then(function(r) {
       if (r.auto_start_modes && r.auto_start_modes.length > 0) {
-        // 已安装，直接跳到安装/启动页
-        var params = '?modes=' + encodeURIComponent(r.auto_start_modes.join(',')) +
-                     '&runtime=' + encodeURIComponent(r.auto_start_runtime || 'auto');
-        window.location.href = 'progress.html' + params;
+        // ─── 非首次启动：在当前页直接拉 Flask，不跳转 ───
+        autoStart(r.auto_start_modes, r.auto_start_runtime || 'auto');
         return;
       }
 
-      // 未安装，跳转到环境信息页
+      // ─── 首次启动：跳转到环境信息页 ───
       var params = '?p=' + encodeURIComponent(r.python_version || '') +
                    '&d=' + r.disk_free_gb.toFixed(1) +
                    '&m=' + r.memory_gb.toFixed(1) +
@@ -63,8 +55,39 @@
                    '&s=' + encodeURIComponent(r.status_msgs.join('|'));
       window.location.href = 'env.html' + params;
     }).catch(function(e) {
-      $status.textContent = '初始化失败: ' + JSON.stringify(e).substring(0, 100);
+      $('status').textContent = '初始化失败: ' + JSON.stringify(e).substring(0, 100);
     });
+  }
+
+  function autoStart(modes, runtime) {
+    $('hero-label').textContent = '启动服务';
+    $('hero-title').innerHTML = '正在启动<em>服务</em>';
+    $('status').textContent = '服务启动中...';
+
+    invoke('start_setup', { modes: modes, runtime: runtime }).catch(function(e) {
+      $('status').textContent = '启动失败: ' + e;
+    });
+
+    // 轮询 Flask，就绪后跳转（Rust 侧 navigate 的兜底）
+    var count = 0;
+    var pollUrl = 'http://localhost:5057';
+    var timer = setInterval(function() {
+      if (++count > 120) { clearInterval(timer); return; }
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', pollUrl, true);
+      xhr.timeout = 1000;
+      xhr.onload = function() {
+        if (xhr.status > 0) {
+          clearInterval(timer);
+          $('hero-title').innerHTML = '正在进入<em>片刻</em>';
+          $('status').textContent = '服务已就绪';
+          invoke('navigate_to_flask', { url: pollUrl }).catch(function(){});
+        }
+      };
+      xhr.onerror = function(){};
+      xhr.ontimeout = function(){};
+      try { xhr.send(); } catch(e) {}
+    }, 500);
   }
 
   requestAnimationFrame(function() {

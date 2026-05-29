@@ -265,11 +265,15 @@ pub fn check_and_apply(
     // 首次启动：不强制更新，只记录当前线上 SHA 作为基准
     if local_sha.is_none() {
         log::info!("First launch, recording SHA: {}", &remote_sha[..8.min(remote_sha.len())]);
-        let state = launcher::InstallState {
-            commit_sha: Some(remote_sha),
-            ..state
-        };
-        launcher::save_install_state(state_path, &state);
+        // 重新加载状态：start_setup 可能已在此线程启动前保存了 modes/runtime
+        let current = launcher::load_install_state(state_path);
+        if current.commit_sha.is_none() {
+            let updated = launcher::InstallState {
+                commit_sha: Some(remote_sha),
+                ..current
+            };
+            launcher::save_install_state(state_path, &updated);
+        }
         return None;
     }
 
