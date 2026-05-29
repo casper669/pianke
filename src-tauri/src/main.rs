@@ -33,11 +33,15 @@ fn main() {
         // FlaskProcess 用于跟踪 Flask 子进程，退出时需要 kill 它
         .manage(commands::FlaskProcess(Mutex::new(None)))
         .setup(|app| {
-            // ─── setup 阶段：路径解析与环境准备 ───
-            // 这里只做同步的初始化工作，不发送任何事件。
-            // 原因是：setup 执行时前端的 Tauri 事件监听器还没注册好，
-            // 如果在这里 emit 事件，前端会丢失这些消息。
-            // 所以耗时操作（环境检测、更新检查）由前端调用 init_setup 命令触发。
+            // ─── setup 阶段：只做纯路径解析，不阻塞 webview 首帧 ───
+            // 所有文件 I/O、venv 创建等耗时操作延迟到前端加载后由 init_setup 触发。
+
+            // 提前显示窗口：避免 init_setup 阻塞主线程导致窗口白屏。
+            // macOS 上 CoreAnimation 需要主线程 run loop 来提交首帧，
+            // 必须在任何可能阻塞主线程的 IPC 调用之前执行 show()。
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+            }
 
             // 资源目录：打包后的 .app/Contents/Resources/（macOS）或 exe 同目录（Windows）
             let resource_dir = app
@@ -46,39 +50,16 @@ fn main() {
                 .map_err(|e| anyhow::anyhow!("无法获取资源目录: {}", e))?;
 
             // 应用数据目录：~/Library/Application Support/com.pianke.desktop/（macOS）
-            // 用于存放虚拟环境、代码副本、安装状态等持久化数据
             let app_data_dir = app
                 .path()
                 .app_data_dir()
                 .map_err(|e| anyhow::anyhow!("无法获取数据目录: {}", e))?;
 
-            // 在系统 PATH 中查找 Python 3.10+
-            let python_path = env_check::find_python();
+            // app_dir 路径（实际提取由 init_setup 延迟执行）
+            let app_dir = app_data_dir.join("app");
 
-            // 步骤 1：提取资源文件到数据目录（快速，不依赖 Python）
-            let app_dir = python_runtime::PythonRuntime::extract_resources(
-                &resource_dir,
-                &app_data_dir,
-            ).unwrap_or_else(|e| {
-                log::error!("Resource extraction failed: {}", e);
-                app_data_dir.join("app")
-            });
-
-            // 步骤 2：尝试快速创建 venv（不自动下载 uv，避免阻塞 UI）
-            // 如果系统 Python 或 uv 已安装，创建会很快（1-2 秒）
-            // 如果两者都没有，设空路径 — init_setup 命令会重试并向前端推送进度
-            let venv_python = python_runtime::PythonRuntime::setup_venv(
-                python_path.as_deref(),
-                &app_data_dir,
-                false,  // 不使用 ensure_uv（不下载），保持 setup 快速
-                |_| {},  // setup 阶段不发送事件，前端监听器尚未注册
-            ).unwrap_or_else(|e| {
-                log::warn!("Fast venv creation failed: {} (will retry in init_setup)", e);
-                std::path::PathBuf::new()
-            });
-
-            // 将应用全局状态注册到 Tauri 的状态管理中，
-            // 后续各命令通过 State<'_, AppState> 访问这些路径
+            // 将应用全局状态注册到 Tauri 的状态管理中
+            // python_path 初始为空，由 init_setup 命令在页面显示后通过 uv 查找/安装
             let home_url = app.get_webview_window("main")
                 .and_then(|w| w.url().ok())
                 .map(|u| u.to_string())
@@ -86,8 +67,8 @@ fn main() {
             let state = launcher::AppState {
                 resource_dir,
                 app_data_dir,
-                python_path: python_path.unwrap_or_default(),
-                venv_python: std::sync::Mutex::new(venv_python),
+                python_path: std::path::PathBuf::new(),
+                venv_python: std::sync::Mutex::new(std::path::PathBuf::new()),
                 app_dir,
                 home_url,
             };
@@ -117,17 +98,13 @@ fn main() {
         // 菜单事件处理 — "检查更新" 菜单项被点击时触发
         .on_menu_event(|app_handle, event| {
             if event.id().as_ref() == "check_update" {
-                // 1. 停掉当前 Flask 进程
+                // 1. 立即停掉 Flask 进程（SIGKILL，不等待优雅退出）
                 if let Some(flask_state) = app_handle.try_state::<commands::FlaskProcess>() {
                     if let Some(mut child) = flask_state.0.lock().unwrap().take() {
                         log::info!("Stopping Flask for update check...");
                         #[cfg(unix)]
                         {
                             let pid = child.id() as i32;
-                            let _ = std::process::Command::new("kill")
-                                .args(["-TERM", &format!("-{}", pid)])
-                                .status();
-                            std::thread::sleep(std::time::Duration::from_millis(500));
                             let _ = std::process::Command::new("kill")
                                 .args(["-KILL", &format!("-{}", pid)])
                                 .status();
@@ -146,21 +123,18 @@ fn main() {
                 // 兜底：清理端口上残留的进程
                 #[cfg(unix)]
                 {
-                    let _ = std::process::Command::new("lsof")
-                        .args(["-ti", ":5057"])
-                        .output()
-                        .ok()
-                        .and_then(|o| {
-                            let pids = String::from_utf8_lossy(&o.stdout);
-                            for pid_str in pids.lines() {
-                                if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                                    let _ = std::process::Command::new("kill")
-                                        .args(["-TERM", &format!("{}", pid)])
-                                        .status();
-                                }
+                    if let Ok(o) = std::process::Command::new("lsof")
+                        .args(["-ti", ":5057"]).output()
+                    {
+                        let pids = String::from_utf8_lossy(&o.stdout);
+                        for pid_str in pids.lines() {
+                            if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                                let _ = std::process::Command::new("kill")
+                                    .args(["-KILL", &format!("{}", pid)])
+                                    .status();
                             }
-                            Some(())
-                        });
+                        }
+                    }
                 }
                 #[cfg(windows)]
                 {
@@ -179,8 +153,7 @@ fn main() {
                     }
                 }
 
-                // 2. 导航回 Tauri 前端
-                // 前端会重新执行 init_setup（含更新检查），若依赖已就绪则自动切回 Flask
+                // 2. 立即导航回 Tauri 前端 = 环境检查页面
                 if let Some(w) = app_handle.get_webview_window("main") {
                     if let Some(app_state) = app_handle.try_state::<launcher::AppState>() {
                         if !app_state.home_url.is_empty() {
@@ -194,7 +167,9 @@ fn main() {
         })
         // 注册所有 IPC 命令 — 前端通过 invoke('命令名', args) 调用
         .invoke_handler(tauri::generate_handler![
-            commands::init_setup,       // 初始化：环境检测 + 更新检查，返回 InitResult
+            commands::show_window,       // 页面加载后显示窗口（配合 visible:false）
+            commands::navigate_to_flask, // 前端轮询 Flask 就绪后跳转
+            commands::init_setup,        // 初始化：环境检测 + 更新检查，返回 InitResult
             commands::check_environment, // 单独的环境检测（目前未使用，保留备用）
             commands::get_modes,         // 获取可选模式列表（含上次选择状态）
             commands::start_setup,       // 开始安装依赖并启动 Flask

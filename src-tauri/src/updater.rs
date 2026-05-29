@@ -35,6 +35,7 @@ const PRESERVE: &[&str] = &[
     ".venv",                        // 虚拟环境，包含已安装的 Python 包
     ".pic_selecter_install.json",   // 安装状态（模式选择、包签名）
     ".pic_selecter_deps.stamp",     // 依赖安装完成的戳记文件
+    "models",                       // 已下载的 HuggingFace 模型文件
     "__pycache__",                  // Python 字节码缓存
     ".git",                         // Git 仓库数据
     ".cache",                       // HuggingFace/transformers 缓存
@@ -310,6 +311,8 @@ pub fn check_and_apply(
         commit_sha: Some(remote_sha.clone()),
         packages_sig: String::new(),
         modes: state.modes,
+        runtime: state.runtime,
+        runtime_backend: state.runtime_backend,
     };
     launcher::save_install_state(state_path, &new_state);
 

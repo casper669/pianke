@@ -36,19 +36,33 @@ pub const CORE_PACKAGES: &[&str] = &[
     "piexif>=1.1.3",             // EXIF 信息处理
 ];
 
-/// 专家模式额外包 — 深度学习模型推理
+/// 专家模式额外包 — 深度学习模型推理（仅专家模式独有的包，torch/onnx 由运行时后端处理）
 pub const EXPERT_PACKAGES: &[&str] = &[
-    "torch>=2.2",           // PyTorch 深度学习框架
-    "torchvision>=0.17",    // 计算机视觉模型
-    "transformers>=4.40",   // HuggingFace transformers（DINOv2 等）
-    "insightface>=0.7",     // 人脸识别
-    "onnxruntime>=1.16",    // ONNX 模型推理
     "pyiqa>=0.1.10",        // 图像质量评估
     "timm>=0.9",            // PyTorch 图像模型库
 ];
 
+/// 视觉基础包 — expert 和 tycoon 共用的模型推理依赖
+pub const VISION_BASE_PACKAGES: &[&str] = &[
+    "transformers>=4.40,<4.47",   // HuggingFace transformers（DINOv2 等，4.47+ 要求 torch>=2.4）
+    "insightface>=0.7",     // 人脸识别
+];
+
 /// 土豪模式额外包 — 云端 API 调用
 pub const TYCOON_PACKAGES: &[&str] = &["openai>=1.40"];
+
+/// CPU 运行时后端包 — 无 NVIDIA GPU 时安装
+pub const RUNTIME_CPU_PACKAGES: &[&str] = &[
+    "torch>=2.2",           // PyTorch 深度学习框架
+    "torchvision>=0.17",    // 计算机视觉模型
+    "onnxruntime>=1.16",    // ONNX 模型推理（CPU 版）
+];
+
+/// CUDA 版 PyTorch 包 — 从 PyTorch 官方 CUDA wheelhouse 安装
+pub const TORCH_CUDA_PACKAGES: &[&str] = &[
+    "torch>=2.2",
+    "torchvision>=0.17",
+];
 
 // ─── 模式信息 ───
 
@@ -126,6 +140,17 @@ pub fn packages_for_modes(modes: &[String]) -> Vec<String> {
         }
     }
 
+    // expert 和 tycoon 都需要视觉基础包（transformers、insightface）
+    let needs_vision = modes.iter().any(|m| m == "expert" || m == "tycoon");
+    if needs_vision {
+        for pkg in VISION_BASE_PACKAGES {
+            let name = pkg_name(pkg);
+            if seen.insert(name) {
+                result.push(pkg.to_string());
+            }
+        }
+    }
+
     // 按模式追加额外包
     for mode in modes {
         let packages: &[&str] = match mode.as_str() {
@@ -190,6 +215,29 @@ impl Default for MirrorConfig {
     }
 }
 
+// ─── CUDA 配置 ───
+
+/// PyTorch CUDA 版本与安装源配置。
+///
+/// 通过环境变量 PIANKE_TORCH_CUDA 切换 CUDA 版本（默认 cu128），
+/// PIANKE_TORCH_INDEX_URL 可完全覆盖 PyTorch 安装源 URL。
+#[derive(Debug, Clone)]
+pub struct CudaConfig {
+    /// CUDA flavor，如 "cu128" / "cu126"
+    pub flavor: String,
+    /// PyTorch CUDA wheelhouse URL
+    pub index_url: String,
+}
+
+impl Default for CudaConfig {
+    fn default() -> Self {
+        let flavor = std::env::var("PIANKE_TORCH_CUDA").unwrap_or_else(|_| "cu128".into());
+        let index_url = std::env::var("PIANKE_TORCH_INDEX_URL")
+            .unwrap_or_else(|_| format!("https://download.pytorch.org/whl/{}", flavor));
+        Self { flavor, index_url }
+    }
+}
+
 // ─── 安装状态持久化 ───
 
 /// 保存在 app_data_dir 中的安装状态，JSON 格式。
@@ -203,9 +251,15 @@ pub struct InstallState {
     /// 已安装的模式列表
     #[serde(default)]
     pub modes: Vec<String>,
+    /// 运行时设备偏好: auto / cpu / gpu
+    #[serde(default)]
+    pub runtime: String,
     /// 包签名 = packages.join("|")，签名变了就触发重装
     #[serde(default)]
     pub packages_sig: String,
+    /// 已安装的运行时后端标识，如 "cuda:cu128" / "cpu" / "none"
+    #[serde(default)]
+    pub runtime_backend: String,
     /// 已安装代码的 GitHub commit SHA，用于增量更新检测
     #[serde(default)]
     pub commit_sha: Option<String>,
@@ -218,7 +272,9 @@ pub fn load_install_state(path: &Path) -> InstallState {
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| InstallState {
             modes: vec![],
+            runtime: String::new(),
             packages_sig: String::new(),
+            runtime_backend: String::new(),
             commit_sha: None,
         })
 }
@@ -230,6 +286,35 @@ pub fn save_install_state(path: &Path, state: &InstallState) {
             let _ = std::fs::create_dir_all(parent);
         }
         let _ = std::fs::write(path, json);
+    }
+}
+
+// ─── GPU 检测与运行时后端 ───
+
+/// 检测系统是否有 NVIDIA GPU（通过 nvidia-smi 命令）。
+pub fn has_nvidia_gpu() -> bool {
+    let name = if cfg!(target_os = "windows") {
+        "nvidia-smi.exe"
+    } else {
+        "nvidia-smi"
+    };
+    std::process::Command::new(name)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// 返回运行时后端标识字符串，用于签名和前端展示。
+pub fn runtime_backend_label(modes: &[String], runtime: &str, force_cpu: bool) -> &'static str {
+    if !modes.iter().any(|m| m == "expert" || m == "tycoon") {
+        return "none";
+    }
+    if !force_cpu && runtime != "cpu" && (runtime == "gpu" || has_nvidia_gpu()) {
+        "cuda"
+    } else {
+        "cpu"
     }
 }
 
