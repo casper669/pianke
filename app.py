@@ -67,6 +67,23 @@ font-size='22' fill='#6b6256'>无法读取</text>
 </svg>""".encode("utf-8")
 
 
+def _normalize_runtime(value: str | None) -> str:
+    runtime = (value or "").strip().lower()
+    return runtime if runtime in ("auto", "cpu", "gpu") else "auto"
+
+
+def _apply_runtime_selection(runtime: str) -> None:
+    runtime = _normalize_runtime(runtime)
+    prev = _normalize_runtime(os.environ.get("PIC_SELECTER_RUNTIME"))
+    os.environ["PIC_SELECTER_RUNTIME"] = runtime
+    if prev != runtime:
+        try:
+            from pic_selecter import vision
+            vision.reset_runtime_state()
+        except Exception:
+            pass
+
+
 # ---------------- 状态 ----------------
 
 @dataclass
@@ -95,6 +112,7 @@ class SessionState:
     dry_run: bool
     mode: str = "copy"                              # copy | move
     engine: str = "fast"                            # fast | expert（极速 vs 专家）
+    runtime: str = "auto"                           # auto | cpu | gpu
     groups: list[GroupState] = field(default_factory=list)
     current_group: int = 0
     threshold_near: int = THRESHOLD_NEAR
@@ -1667,7 +1685,7 @@ def _job_event(name: str, path: str, info, reason) -> None:
             {"kind": "skip", "label": "—", "value": "—"},
         ]
     elif engine == "fast":
-        # 三列：hash 摘要 / HSV 颜色指纹 / ORB 关键点数 + 锐度
+        # 三列：指纹 / 色调 / 细节
         ph = (info.phash or "")[:4]
         dh = (info.dhash or "")[:4]
         hash_val = f"{ph}·{dh}" if (ph and dh) else "—"
@@ -1677,44 +1695,43 @@ def _job_event(name: str, path: str, info, reason) -> None:
         orb_val = f"{orb_n}pt" if orb_n else "数据不足"
         sharp_val = f"分 {sharp:.0f}" if sharp is not None else "—"
         signals = [
-            {"kind": "hash", "label": "hash", "value": hash_val},
-            {"kind": "color", "label": "HSV", "value": color_val},
-            {"kind": "orb", "label": "ORB", "value": f"{orb_val} · {sharp_val}"},
+            {"kind": "hash", "label": "指纹", "value": hash_val},
+            {"kind": "color", "label": "色调", "value": color_val},
+            {"kind": "orb", "label": "细节", "value": f"{orb_val} · {sharp_val}"},
         ]
     elif engine == "tycoon":
         dv = getattr(info, "dinov2", None)
-        dino_val = f"feat {dv.shape[0]}d" if dv is not None else "缺失"
+        dino_val = "已建" if dv is not None else "缺失"
         verdict_llm = getattr(info, "llm_verdict", None) or q.get("llm_verdict")
         reason_llm = getattr(info, "llm_reason", None) or q.get("llm_reason") or ""
         if verdict_llm:
             llm_val = f"{verdict_llm.upper()} · {reason_llm}" if reason_llm else verdict_llm.upper()
         elif q.get("auto_reject"):
-            # 没 LLM 判定但已被 auto_reject → 是极速进阶版预审拒掉的，LLM 就没跑
-            llm_val = "初筛不通过，LLM 无需介入"
+            llm_val = "初筛已淘汰，无需进一步判定"
         else:
             llm_val = "缺失"
         fe = getattr(info, "face_embeddings", None) or []
         face_val = f"脸×{len(fe)}" if fe else "无脸"
         signals = [
-            {"kind": "dino", "label": "DINOv2", "value": dino_val},
-            {"kind": "llm", "label": "🤖 LLM", "value": llm_val},
+            {"kind": "dino", "label": "画面", "value": dino_val},
+            {"kind": "llm", "label": "🤖 判图", "value": llm_val},
             {"kind": "face", "label": "脸", "value": face_val},
         ]
     else:  # expert
         dv = getattr(info, "dinov2", None)
-        dino_val = f"feat {dv.shape[0]}d" if dv is not None else "缺失"
+        dino_val = "已建" if dv is not None else "缺失"
         aes = getattr(info, "aesthetic_score", None)
         musiq = getattr(info, "musiq_score", None)
         clip = getattr(info, "clipiqa_score", None)
         parts = []
-        if aes is not None: parts.append(f"N{aes:.1f}")
-        if musiq is not None: parts.append(f"M{musiq:.0f}")
-        if clip is not None: parts.append(f"C{clip:.2f}")
+        if aes is not None: parts.append(f"美{aes:.1f}")
+        if musiq is not None: parts.append(f"质{musiq:.0f}")
+        if clip is not None: parts.append(f"调{clip:.2f}")
         aes_val = "·".join(parts) if parts else "缺失"
         fe = getattr(info, "face_embeddings", None) or []
         face_val = f"脸×{len(fe)}" if fe else "无脸"
         signals = [
-            {"kind": "dino", "label": "DINOv2", "value": dino_val},
+            {"kind": "dino", "label": "画面", "value": dino_val},
             {"kind": "nima", "label": "美学", "value": aes_val},
             {"kind": "face", "label": "脸", "value": face_val},
         ]
@@ -1973,11 +1990,11 @@ def _run_job(folder: str, dry_run: bool, mode: str, wipe_cache: bool,
 
         job.status = "hashing"
         if engine == "fast":
-            job.label = "扫描与计算指纹（pHash + dHash + wHash + aHash + HSV + ORB）..."
+            job.label = "正在扫描照片、计算每张图的画面指纹..."
         elif engine == "tycoon":
-            job.label = f"扫描 + DINOv2 + InsightFace + LLM 初筛（模型: {llm_model}）..."
+            job.label = "正在扫描照片、用云端视觉能力做初筛..."
         else:
-            job.label = "扫描与计算 pHash + DINOv2 + NIMA/MUSIQ/CLIP + 人脸嵌入..."
+            job.label = "正在扫描照片、识别画面与人脸、评估质量..."
         infos, skipped = grouper.compute_infos(
             folder,
             progress=_job_progress,
@@ -2047,6 +2064,7 @@ def _run_job(folder: str, dry_run: bool, mode: str, wipe_cache: bool,
             prescreen_strength=prescreen_strength,
             engine=engine,
         )
+        sess.runtime = _normalize_runtime(os.environ.get("PIC_SELECTER_RUNTIME"))
         sess.prescreen_enabled = prescreen_enabled
         sess.prescreen_strength = prescreen_strength
         sess.prescreen_reviewed = True
@@ -2240,6 +2258,7 @@ def api_start():
     global JOB, SESSION
     data = request.get_json(force=True)
     folder = (data.get("folder") or "").strip()
+    runtime = _normalize_runtime(data.get("runtime"))
     dry_run = bool(data.get("dry_run", False))
     wipe_cache = bool(data.get("wipe_cache", False))
     mode = data.get("mode", "copy")
@@ -2274,6 +2293,7 @@ def api_start():
         if JOB and JOB.status in ("pending", "scanning", "hashing", "grouping"):
             return jsonify({"error": "已有任务在跑，请稍候"}), 409
 
+        _apply_runtime_selection(runtime)
         # 一次性运行：始终全新开始，不读旧 state，不复用缓存。
         # 旧的 state.json / winners / losers 由 _run_job 里的 _wipe_caches 清掉。
         JOB = JobState(
@@ -3730,15 +3750,20 @@ def main():
     parser = argparse.ArgumentParser(description="本地照片擂台选片工具")
     parser.add_argument("--port", type=int, default=5057)
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument("--runtime", choices=["auto", "cpu", "gpu"], default="auto")
     args = parser.parse_args()
 
+    _apply_runtime_selection(args.runtime)
     setup_logger(None)
     url = f"http://localhost:{args.port}"
     print(f"\n启动于 {url}")
+    print(f"运行时设备偏好: {args.runtime}")
     if SCRIPT_TOKEN:
         print(f"（脚本访问 token 已启用：X-Token: {SCRIPT_TOKEN[:8]}...）")
     if not args.no_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    # 仅监听回环：前端依赖 Origin/Referer 严格匹配防 CSRF，绑 0.0.0.0
+    # 会把局域网也暴露进来，已被验证会绕过这套校验。
     app.run(host="127.0.0.1", port=args.port, debug=False)
 
 

@@ -17,7 +17,7 @@ use std::process::{Child, Command, Stdio};
 
 use anyhow::{Context, Result};
 
-use crate::launcher::MirrorConfig;
+use crate::launcher::{CudaConfig, MirrorConfig};
 
 /// Python 运行时的路径信息。
 ///
@@ -144,6 +144,14 @@ impl PythonRuntime {
             }
         }
 
+        // macOS x86_64: llvmlite >= 0.44 不再提供 Intel Mac wheel
+        // numba>=0.59,<0.60 → llvmlite>=0.43,<0.45 → 0.43.x 有
+        // cp312 + x86_64 wheel；numba<0.59 会拉到 llvmlite 0.41
+        // 不支持 Python 3.12
+        if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+            cmd.arg("numba>=0.59,<0.60");
+        }
+
         for pkg in packages {
             cmd.arg(pkg);
         }
@@ -154,43 +162,25 @@ impl PythonRuntime {
 
         let mut child = cmd.spawn().context("Failed to start installer")?;
 
-        // 逐行读取 stderr 并解析进度信息
+        // 逐行读取 stderr 并解析进度信息，同时收集全部行用于错误诊断
         let stderr = child.stderr.take().unwrap();
         let reader = BufReader::new(stderr);
 
-        let mut installed = 0usize;
+        let mut all_lines: Vec<String> = Vec::new();
         for line in reader.lines() {
             let line = match line {
                 Ok(l) => l,
                 Err(_) => break,
             };
             let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            // uv 的进度输出格式
-            if trimmed.starts_with("Resolved") && using_uv {
-                on_progress(trimmed);
-            } else if trimmed.starts_with("Prepared") && using_uv {
-                on_progress(trimmed);
-            } else if trimmed.starts_with("Installed") && using_uv {
+            let is_empty = trimmed.is_empty();
+            if !is_empty {
+                all_lines.push(trimmed.to_string());
                 on_progress(trimmed);
             }
-
-            // pip 的进度输出格式
-            if trimmed.starts_with("Collecting ") {
-                let pkg_info = trimmed.strip_prefix("Collecting ").unwrap_or(trimmed);
-                installed += 1;
-                on_progress(&format!("[{}/{}] 下载 {}", installed, total, pkg_info));
-            } else if trimmed.starts_with("Downloading ") {
-                on_progress(trimmed);
-            } else if trimmed.starts_with("Installing collected packages") {
-                on_progress("正在安装已下载的包...");
-            } else if trimmed.starts_with("Successfully installed") {
-                on_progress(trimmed);
+            if !is_empty {
+                log::debug!("install: {}", trimmed);
             }
-            log::debug!("install: {}", trimmed);
         }
 
         // 排空 stdout（避免子进程阻塞）
@@ -200,7 +190,18 @@ impl PythonRuntime {
 
         let status = child.wait().context("Install process failed")?;
         if !status.success() {
-            anyhow::bail!("Install returned non-zero exit: {}", status);
+            // 取最后 20 行非空输出来定位问题
+            let detail = all_lines.iter()
+                .rev()
+                .take(20)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let detail = if detail.is_empty() { "(no output)".to_string() } else { detail };
+            anyhow::bail!("Install returned non-zero exit: {}\n--- pip output ---\n{}", status, detail);
         }
 
         // 修复 OpenCV 冲突：如果同时安装了 opencv-python 和 opencv-contrib-python，
@@ -209,6 +210,225 @@ impl PythonRuntime {
         self.fix_opencv_conflict(uv.as_deref())?;
 
         on_progress("依赖安装完成");
+        Ok(())
+    }
+
+    /// 卸载指定的 pip 包（静默，忽略错误）。
+    fn pip_uninstall(&self, packages: &[&str]) {
+        if packages.is_empty() {
+            return;
+        }
+        let _ = Command::new(&self.venv_python)
+            .args(["-m", "pip", "uninstall", "-y"])
+            .args(packages)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    /// 安装运行时后端（torch / onnxruntime），自动选择 CPU 或 CUDA 版本。
+    ///
+    /// 对应上游 scripts/launcher.py 的 ensure_runtime_backends()。
+    ///
+    /// 逻辑：
+    /// - 没选 expert/tycoon → 跳过，返回 "none"
+    /// - wants_cuda → 先卸载旧后端，从 PyTorch CUDA wheelhouse 装 torch，
+    ///   再从 PyPI 装 onnxruntime-gpu，返回 "cuda:cu128"
+    /// - 否则 → 装 CPU 版，返回 "cpu"
+    pub fn install_runtime_backend(
+        &self,
+        modes: &[String],
+        runtime: &str,
+        mirror: &MirrorConfig,
+        cuda: &CudaConfig,
+        on_progress: impl Fn(&str),
+    ) -> Result<String> {
+        if !modes.iter().any(|m| m == "expert" || m == "tycoon") {
+            return Ok("none".into());
+        }
+
+        let wants_cuda = crate::launcher::runtime_backend_label(modes, runtime, false) == "cuda";
+
+        if wants_cuda {
+            on_progress(&format!(
+                "检测到 NVIDIA GPU，安装 CUDA 版 PyTorch（{}）+ ONNX Runtime GPU",
+                cuda.flavor
+            ));
+
+            // 先卸载旧后端，避免包冲突
+            self.pip_uninstall(&[
+                "onnxruntime",
+                "onnxruntime-gpu",
+                "onnxruntime-directml",
+                "torch",
+                "torchvision",
+                "torchaudio",
+            ]);
+
+            // 步骤 1：安装 torch + torchvision
+            // 优先走镜像源（国内加速），官方 CUDA wheelhouse 作为回退
+            let torch_cuda: Vec<String> = crate::launcher::TORCH_CUDA_PACKAGES
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let (torch_index, torch_extra): (String, Vec<String>) = if mirror.use_mirror {
+                on_progress(&format!("使用镜像源安装 CUDA 版 PyTorch: {}", mirror.pypi_label));
+                (mirror.pypi_index.clone(), vec![cuda.index_url.clone(), mirror.pypi_extra.clone()])
+            } else {
+                (cuda.index_url.clone(), vec![])
+            };
+            self.install_with_options(
+                &torch_cuda,
+                Some(&torch_index),
+                &torch_extra,
+                true,  // upgrade
+                true,  // force_reinstall
+                &on_progress,
+            )?;
+
+            // 步骤 2：安装 onnxruntime-gpu
+            let onnx_gpu = ["onnxruntime-gpu[cuda,cudnn]>=1.16".to_string()];
+            let pypi_url = if mirror.use_mirror {
+                mirror.pypi_index.clone()
+            } else {
+                "https://pypi.org/simple/".into()
+            };
+            let pypi_fallback: Vec<String> = if mirror.use_mirror {
+                vec![mirror.pypi_extra.clone()]
+            } else {
+                vec![]
+            };
+            self.install_with_options(
+                &onnx_gpu,
+                Some(&pypi_url),
+                &pypi_fallback,
+                true,
+                true,
+                &on_progress,
+            )?;
+
+            Ok(format!("cuda:{}", cuda.flavor))
+        } else {
+            on_progress("未检测到 NVIDIA GPU，安装 CPU 版 torch / onnxruntime");
+            let cpu_pkgs: Vec<String> = crate::launcher::RUNTIME_CPU_PACKAGES
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let idx = if mirror.use_mirror { Some(mirror.pypi_index.as_str()) } else { None };
+            let extras: Vec<String> = if mirror.use_mirror { vec![mirror.pypi_extra.clone()] } else { vec![] };
+            self.install_with_options(
+                &cpu_pkgs,
+                idx,
+                &extras,
+                true,  // upgrade
+                false, // force_reinstall
+                &on_progress,
+            )?;
+            Ok("cpu".into())
+        }
+    }
+
+    /// 带选项的 pip 安装（内部方法）。
+    ///
+    /// 与 install_packages 的区别：
+    /// - 支持指定 index_url（用于 PyTorch CUDA wheelhouse）
+    /// - 支持 --upgrade 和 --force-reinstall
+    fn install_with_options(
+        &self,
+        packages: &[String],
+        index_url: Option<&str>,
+        extra_index_urls: &[String],
+        upgrade: bool,
+        force_reinstall: bool,
+        on_progress: impl Fn(&str),
+    ) -> Result<()> {
+        if packages.is_empty() {
+            return Ok(());
+        }
+
+        let uv = ensure_uv(&on_progress);
+        let using_uv = uv.is_some();
+
+        let mut cmd = if let Some(ref uv_path) = uv {
+            let mut c = Command::new(uv_path);
+            c.args(["pip", "install", "--python"])
+                .arg(&self.venv_python);
+            c
+        } else {
+            let mut c = Command::new(&self.venv_python);
+            c.args(["-m", "pip", "install", "--disable-pip-version-check", "--no-input"]);
+            c
+        };
+
+        if upgrade {
+            cmd.arg("--upgrade");
+        }
+        if force_reinstall {
+            cmd.arg("--force-reinstall");
+        }
+
+        if let Some(url) = index_url {
+            if using_uv {
+                cmd.arg("--index-url").arg(url);
+            } else {
+                cmd.arg("-i").arg(url);
+            }
+            for extra in extra_index_urls {
+                if using_uv {
+                    cmd.arg("--extra-index-url").arg(extra.as_str());
+                } else {
+                    cmd.arg("--extra-index-url").arg(extra.as_str());
+                }
+            }
+        }
+
+        for pkg in packages {
+            cmd.arg(pkg);
+        }
+
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().context("Failed to start installer")?;
+        let stderr = child.stderr.take().unwrap();
+        let reader = BufReader::new(stderr);
+
+        let mut all_lines: Vec<String> = Vec::new();
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            let trimmed = line.trim();
+            let is_empty = trimmed.is_empty();
+            if !is_empty {
+                all_lines.push(trimmed.to_string());
+                on_progress(trimmed);
+            }
+            if !is_empty {
+                log::debug!("install: {}", trimmed);
+            }
+        }
+
+        if let Some(stdout) = child.stdout.take() {
+            for _ in BufReader::new(stdout).lines() {}
+        }
+
+        let status = child.wait().context("Install process failed")?;
+        if !status.success() {
+            let detail = all_lines.iter()
+                .rev()
+                .take(20)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let detail = if detail.is_empty() { "(no output)".to_string() } else { detail };
+            anyhow::bail!("Install returned non-zero exit: {}\n--- pip output ---\n{}", status, detail);
+        }
+
         Ok(())
     }
 
@@ -251,6 +471,7 @@ impl PythonRuntime {
     pub fn start_flask(
         &self,
         port: u16,
+        runtime: &str,
         mirror: &MirrorConfig,
     ) -> Result<Child> {
         let app_py = self.app_dir.join("app.py");
@@ -258,11 +479,15 @@ impl PythonRuntime {
             anyhow::bail!("app.py not found at {:?}", app_py);
         }
 
-        log::info!("Starting Flask on port {}...", port);
+        let rt = if runtime.is_empty() { "auto" } else { runtime };
+
+        log::info!("Starting Flask on port {} (runtime={})...", port, rt);
         let mut cmd = Command::new(&self.venv_python);
         cmd.arg(&app_py)
             .arg("--port")
             .arg(port.to_string())
+            .arg("--runtime")
+            .arg(rt)
             .arg("--no-browser")
             .current_dir(&self.app_dir);
 
@@ -270,6 +495,8 @@ impl PythonRuntime {
         if mirror.use_mirror {
             cmd.env("HF_ENDPOINT", &mirror.hf_endpoint);
         }
+
+        cmd.env("PIC_SELECTER_RUNTIME", rt);
 
         // Unix: 创建独立进程组，退出时可整组 kill，避免子进程变孤儿
         #[cfg(unix)]
@@ -552,9 +779,9 @@ fn create_venv(python_path: Option<&Path>, venv_dir: &Path, use_ensure_uv: bool,
     if let Some(ref uv) = uv {
         on_progress("使用 uv 创建虚拟环境（可能需下载 Python）...");
         log::info!("Using uv to create venv (may auto-download Python)...");
-        // uv venv --python ">=3.10" 自动选择/下载符合要求的 Python 版本
+        // uv venv --python ">=3.10,<3.14"：PyTorch 没有 cp314 的 wheel，卡住上限
         let mut child = Command::new(uv)
-            .args(["venv", "--python", ">=3.10"])
+            .args(["venv", "--python", ">=3.10,<3.14"])
             .arg(venv_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" style="background:#f5f2ea">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -73,9 +73,20 @@ body::before {
 }
 .brand-mark {
   width: 36px; height: 36px; border-radius: 50%;
-  background: radial-gradient(circle at 38% 32%, #e29274, #cc785c 60%, #ad5841);
-  box-shadow: inset 0 1px 0 rgba(255,255,255,0.25), inset 0 -2px 3px rgba(0,0,0,0.12), 0 2px 6px rgba(204,120,92,0.25);
+  background: radial-gradient(circle at 40% 35%, #f0c4b0, #cc785c 55%, #a44d35);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.3), inset 0 -2px 3px rgba(0,0,0,0.1), 0 2px 8px rgba(204,120,92,0.22);
   flex-shrink: 0;
+  position: relative;
+}
+.brand-mark::after {
+  content: '';
+  position: absolute;
+  inset: 7px;
+  border-radius: 50%;
+  border: 1.5px solid rgba(255,255,255,0.45);
+  border-top-color: transparent;
+  border-right-color: transparent;
+  transform: rotate(-30deg);
 }
 .brand-text {
   font-family: var(--font-serif);
@@ -160,7 +171,8 @@ body::before {
 }
 .mode-card:hover { border-color: var(--accent); box-shadow: var(--shadow-md); }
 .mode-card.active { border-color: var(--accent); background: var(--accent-soft); }
-.mode-card input[type="checkbox"] {
+.mode-card input[type="checkbox"],
+.mode-card input[type="radio"] {
   accent-color: var(--accent);
   width: 16px; height: 16px;
   margin-top: 1px;
@@ -300,6 +312,27 @@ body::before {
   <div class="card" id="mode-card" style="display:none;">
     <div class="mode-label-row">选择功能模式</div>
     <div class="mode-list" id="mode-list"></div>
+    <div class="mode-label-row" style="margin-top:18px;">运行时设备偏好</div>
+    <div class="mode-list" id="runtime-list">
+      <label class="mode-card active">
+        <input type="radio" name="runtime" value="auto" checked onchange="onRuntimeChange(this)">
+        <div>
+          <div class="mode-title">auto · 自动</div>
+          <div class="mode-desc">检测到可用 GPU 就优先用，否则用 CPU</div>
+        </div></label>
+      <label class="mode-card">
+        <input type="radio" name="runtime" value="cpu" onchange="onRuntimeChange(this)">
+        <div>
+          <div class="mode-title">cpu · 仅 CPU</div>
+          <div class="mode-desc">只用 CPU 推理，不安装 CUDA 依赖（省约 2GB 下载）</div>
+        </div></label>
+      <label class="mode-card">
+        <input type="radio" name="runtime" value="gpu" onchange="onRuntimeChange(this)">
+        <div>
+          <div class="mode-title">gpu · 强制 GPU</div>
+          <div class="mode-desc">强制使用 GPU，没有可用 GPU 就报错</div>
+        </div></label>
+    </div>
     <button class="btn" id="btn-start">开始安装</button>
   </div>
 
@@ -317,6 +350,10 @@ body::before {
   var invoke = window.__TAURI_INTERNALS__.invoke;
   var eventApi = window.__TAURI__ && window.__TAURI__.event;
 
+  // 先让窗口和页面渲染出来，再把 init_setup 放到下一帧执行，
+  // 确保用户先看到加载 spinner，不被 init_setup 的耗时操作阻塞首帧。
+  invoke('show_window').catch(function(){});
+
   function $(id) { return document.getElementById(id); }
 
   function log(msg, cls) {
@@ -331,111 +368,124 @@ body::before {
   function show(id) { $(id).style.display = 'block'; }
   function hide(id) { $(id).style.display = 'none'; }
 
+  var flaskUrl = null;
+
   var listenersReady = Promise.resolve();
   if (eventApi) {
     listenersReady = Promise.all([
       eventApi.listen('setup:status',   function(e) { log(e.payload, 'log-status'); }),
       eventApi.listen('setup:progress', function(e) { log(e.payload); }),
       eventApi.listen('setup:error',    function(e) { log(e.payload, 'log-error'); $('prog-dot').style.display = 'none'; }),
-      eventApi.listen('setup:ready',    function(e) { log('服务已启动: ' + e.payload, 'log-status'); })
+      eventApi.listen('setup:ready',    function(e) { flaskUrl = e.payload; })
     ]).catch(function(){});
   }
 
-  // Step 1: init
-  invoke('init_setup').then(function(r) {
-    hide('loading-card');
+  // 等到首帧渲染后再启动 init_setup，避免阻塞页面显示
+  function initAfterPaint() {
+    invoke('init_setup').then(function(r) {
+      hide('loading-card');
 
-    var parts = [];
-    var hasIssues = r.warnings.length > 0 || r.errors.length > 0;
+      // Auto-start: skip env-card, go directly to progress
+      if (r.auto_start_modes && r.auto_start_modes.length > 0) {
+        doStartSetup(r.auto_start_modes, r.auto_start_runtime || 'auto');
+        return;
+      }
 
-    if (r.python_version) {
-      parts.push('<div class="card-row">' +
-        '<div class="item">Python <b class="status-ok">' + r.python_version + '</b></div>' +
-        '<div class="item">可用磁盘 <b>' + r.disk_free_gb.toFixed(1) + ' GB</b></div>' +
-        '<div class="item">内存 <b>' + r.memory_gb.toFixed(1) + ' GB</b></div>' +
-        '</div>');
-    }
-    if (r.warnings.length) {
-      r.warnings.forEach(function(w) { parts.push('<div class="item status-warn" style="margin-top:6px;">⚠ ' + w + '</div>'); });
-    }
-    if (r.errors.length) {
-      r.errors.forEach(function(e) { parts.push('<div class="item status-err" style="margin-top:6px;">✕ ' + e + '</div>'); });
-    }
-    if (r.status_msgs.length) {
-      parts.push('<div style="margin-top:10px;font-size:11px;color:var(--ink-faint);font-family:var(--font-mono);">');
-      r.status_msgs.forEach(function(m) { parts.push('· ' + m + '<br>'); });
-      parts.push('</div>');
-    }
-    $('env-card').innerHTML = parts.join('');
-    show('env-card');
+      // Normal flow: render env-card
+      var parts = [];
+      if (r.python_version) {
+        parts.push('<div class="card-row">' +
+          '<div class="item">Python <b class="status-ok">' + r.python_version + '</b></div>' +
+          '<div class="item">可用磁盘 <b>' + r.disk_free_gb.toFixed(1) + ' GB</b></div>' +
+          '<div class="item">内存 <b>' + r.memory_gb.toFixed(1) + ' GB</b></div>' +
+          '</div>');
+      }
+      if (r.warnings.length) {
+        r.warnings.forEach(function(w) { parts.push('<div class="item status-warn" style="margin-top:6px;">⚠ ' + w + '</div>'); });
+      }
+      if (r.errors.length) {
+        r.errors.forEach(function(e) { parts.push('<div class="item status-err" style="margin-top:6px;">✕ ' + e + '</div>'); });
+      }
+      if (r.status_msgs.length) {
+        parts.push('<div style="margin-top:10px;font-size:11px;color:var(--ink-faint);font-family:var(--font-mono);">');
+        r.status_msgs.forEach(function(m) { parts.push('· ' + m + '<br>'); });
+        parts.push('</div>');
+      }
+      $('env-card').innerHTML = parts.join('');
+      show('env-card');
 
-    // Update hero
-    if (r.errors.length) {
-      $('hero-title').innerHTML = '环境存在<em>问题</em>';
-      $('hero-label').textContent = '检测结果';
-    } else if (!r.python_version) {
-      $('hero-title').innerHTML = '需要安装<em>Python</em>';
-      $('hero-label').textContent = '检测结果';
-    } else {
-      $('hero-title').innerHTML = '环境<em>就绪</em>';
-      $('hero-label').textContent = '检测结果';
-    }
+      if (r.errors.length) {
+        $('hero-title').innerHTML = '环境存在<em>问题</em>';
+        $('hero-label').textContent = '检测结果';
+      } else if (!r.python_version) {
+        $('hero-title').innerHTML = '需要安装<em>Python</em>';
+        $('hero-label').textContent = '检测结果';
+      } else {
+        $('hero-title').innerHTML = '环境<em>就绪</em>';
+        $('hero-label').textContent = '检测结果';
+      }
 
-    // Auto-start if previously installed
-    if (r.auto_start_modes && r.auto_start_modes.length > 0) {
-      log('检测到已安装，正在启动服务...', 'log-status');
-      doStartSetup(r.auto_start_modes);
-      return;
-    }
-
-    return invoke('get_modes');
-  }).then(function(modes) {
-    if (!modes) return;
-    var html = '';
-    modes.forEach(function(m) {
-      html += '<label class="mode-card' + (m.selected ? ' active' : '') + '">' +
-        '<input type="checkbox" value="' + m.key + '"' + (m.selected ? ' checked' : '') +
-        ' onchange="this.parentElement.classList.toggle(\'active\', this.checked)">' +
-        '<div>' +
-        '<div class="mode-title">' + m.label + '</div>' +
-        '<div class="mode-desc">' + m.description + '</div>' +
-        '<div class="mode-meta">' + m.download_size + ' · ' + m.time_estimate + '</div>' +
-        '</div></label>';
+      return invoke('get_modes');
+    }).then(function(modes) {
+      if (!modes) return;
+      var html = '';
+      modes.forEach(function(m) {
+        html += '<label class="mode-card' + (m.selected ? ' active' : '') + '">' +
+          '<input type="checkbox" value="' + m.key + '"' + (m.selected ? ' checked' : '') +
+          ' onchange="this.parentElement.classList.toggle(\'active\', this.checked)">' +
+          '<div>' +
+          '<div class="mode-title">' + m.label + '</div>' +
+          '<div class="mode-desc">' + m.description + '</div>' +
+          '<div class="mode-meta">' + m.download_size + ' · ' + m.time_estimate + '</div>' +
+          '</div></label>';
+      });
+      $('mode-list').innerHTML = html;
+      show('mode-card');
+      $('hero-title').innerHTML = '选择<em>功能模式</em>';
+      $('hero-label').textContent = '安装配置';
+    }).catch(function(e) {
+      hide('loading-card');
+      $('env-card').innerHTML = '<div class="item status-err">初始化失败: ' + JSON.stringify(e).substring(0,200) + '</div>';
+      show('env-card');
+      $('hero-title').innerHTML = '初始化<em>失败</em>';
     });
-    $('mode-list').innerHTML = html;
-    show('mode-card');
-    $('hero-title').innerHTML = '选择<em>功能模式</em>';
-    $('hero-label').textContent = '安装配置';
-  }).catch(function(e) {
-    hide('loading-card');
-    $('env-card').innerHTML = '<div class="item status-err">初始化失败: ' + JSON.stringify(e).substring(0,200) + '</div>';
-    show('env-card');
-    $('hero-title').innerHTML = '初始化<em>失败</em>';
+  }
+
+  // 双 rAF 确保浏览器完成首帧绘制后再启动检测
+  requestAnimationFrame(function() {
+    requestAnimationFrame(initAfterPaint);
   });
 
-  function doStartSetup(modes) {
+  function doStartSetup(modes, runtime) {
     hide('env-card');
     hide('mode-card');
     hide('hero-block');
     show('progress-card');
-    $('prog-title').textContent = '正在安装...';
+    $('prog-title').textContent = '正在启动服务...';
+    runtime = runtime || 'auto';
 
     listenersReady.then(function() {
-      invoke('start_setup', { modes: modes }).catch(function(e) {
+      invoke('start_setup', { modes: modes, runtime: runtime }).catch(function(e) {
         log('启动失败: ' + e, 'log-error');
         $('prog-dot').style.display = 'none';
       });
     });
 
-    // Polling fallback
+    // Poll Flask, navigate when it responds (keeps progress card visible)
     var count = 0;
+    var url = 'http://localhost:5057';
     var timer = setInterval(function() {
       if (++count > 120) { clearInterval(timer); return; }
       var xhr = new XMLHttpRequest();
-      xhr.open('GET', 'http://localhost:5057', true);
+      xhr.open('GET', url, true);
       xhr.timeout = 1000;
       xhr.onload = function() {
-        if (xhr.status > 0) { clearInterval(timer); log('服务已就绪', 'log-status'); }
+        if (xhr.status > 0) {
+          clearInterval(timer);
+          log('服务已就绪', 'log-status');
+          var target = flaskUrl || url;
+          invoke('navigate_to_flask', { url: target }).catch(function(){});
+        }
       };
       xhr.onerror = function(){};
       xhr.ontimeout = function(){};
@@ -448,8 +498,17 @@ body::before {
     var modes = [];
     checks.forEach(function(c) { modes.push(c.value); });
     if (modes.length === 0) { alert('请至少选择一个模式'); return; }
-    doStartSetup(modes);
+    var runtimeRadio = document.querySelector('input[name=runtime]:checked');
+    var runtime = runtimeRadio ? runtimeRadio.value : 'auto';
+    doStartSetup(modes, runtime);
   });
+
+  window.onRuntimeChange = function(el) {
+    document.querySelectorAll('#runtime-list .mode-card').forEach(function(card) {
+      card.classList.remove('active');
+    });
+    el.parentElement.classList.add('active');
+  };
 })();
 </script>
 </body>

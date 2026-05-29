@@ -21,6 +21,9 @@
 from __future__ import annotations
 
 import logging
+import os
+import shutil
+import sys
 import threading
 from pathlib import Path
 from typing import List, Tuple
@@ -33,10 +36,42 @@ logger = logging.getLogger("pic_selecter")
 _LOCK = threading.Lock()
 _models: dict = {}
 _DEVICE = None
+_MODEL_STORAGE_READY = False
 
 
 class VisionUnavailable(RuntimeError):
     """专家模式视觉栈某个组件不可用。"""
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _legacy_cache_base() -> Path:
+    return Path.home() / ".cache"
+
+
+def _runtime_preference() -> str:
+    choice = _env_choice("PIC_SELECTER_RUNTIME", {"auto", "cpu", "gpu"})
+    return choice or "auto"
+
+
+def reset_runtime_state() -> None:
+    """切换 runtime 后清空已加载模型与设备缓存。"""
+    global _DEVICE
+    with _LOCK:
+        _models.clear()
+        _DEVICE = None
+
+
+def _env_choice(name: str, allowed: set[str]) -> str | None:
+    value = (os.environ.get(name) or "").strip().lower()
+    if not value:
+        return None
+    if value in allowed:
+        return value
+    logger.warning("vision: 忽略无效环境变量 %s=%r（允许: %s）", name, value, ", ".join(sorted(allowed)))
+    return None
 
 
 def _device():
@@ -44,22 +79,260 @@ def _device():
     if _DEVICE is not None:
         return _DEVICE
     import torch
-    if torch.backends.mps.is_available():
+    runtime = _runtime_preference()
+    forced = _env_choice("PIC_SELECTER_DEVICE", {"cpu", "cuda", "mps"})
+    if runtime == "cpu" and forced is None:
+        forced = "cpu"
+    elif runtime == "gpu" and forced is None:
+        if torch.cuda.is_available():
+            forced = "cuda"
+        elif torch.backends.mps.is_available():
+            forced = "mps"
+        else:
+            raise VisionUnavailable("PIC_SELECTER_RUNTIME=gpu，但当前既无 CUDA 也无 MPS。")
+    if forced == "cuda":
+        if not torch.cuda.is_available():
+            raise VisionUnavailable("PIC_SELECTER_DEVICE=cuda，但当前 torch 不支持 CUDA。")
+        _DEVICE = torch.device("cuda")
+        logger.info("vision: 按 PIC_SELECTER_DEVICE 强制使用 CUDA")
+    elif forced == "mps":
+        if not torch.backends.mps.is_available():
+            raise VisionUnavailable("PIC_SELECTER_DEVICE=mps，但当前 torch 不支持 MPS。")
         _DEVICE = torch.device("mps")
-        logger.info("vision: 使用 MPS（Apple Silicon GPU）")
+        logger.info("vision: 按 PIC_SELECTER_DEVICE 强制使用 MPS")
+    elif forced == "cpu":
+        _DEVICE = torch.device("cpu")
+        logger.info("vision: 按 PIC_SELECTER_DEVICE 强制使用 CPU")
     elif torch.cuda.is_available():
         _DEVICE = torch.device("cuda")
         logger.info("vision: 使用 CUDA")
+    elif torch.backends.mps.is_available():
+        _DEVICE = torch.device("mps")
+        logger.info("vision: 使用 MPS（Apple Silicon GPU）")
     else:
         _DEVICE = torch.device("cpu")
         logger.info("vision: 使用 CPU")
     return _DEVICE
 
 
+def _device_type() -> str:
+    return getattr(_device(), "type", str(_device()))
+
+
 def _cache_dir() -> Path:
-    d = Path.home() / ".cache" / "pic_selecter"
+    d = _project_root() / "models"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _hf_home() -> Path:
+    return _cache_dir() / "huggingface"
+
+
+def _hf_hub_cache() -> Path:
+    return _hf_home() / "hub"
+
+
+def _torch_home() -> Path:
+    return _cache_dir() / "torch"
+
+
+def _insightface_root() -> Path:
+    return _cache_dir() / "insightface"
+
+
+def _hf_model_dir(model_id: str) -> Path:
+    return _hf_hub_cache() / f"models--{model_id.replace('/', '--')}"
+
+
+def _move_tree(src: Path, dest: Path, label: str) -> None:
+    if not src.exists():
+        return
+    if src.resolve() == dest.resolve():
+        return
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if not dest.exists():
+        logger.info("vision: 迁移%s缓存 %s -> %s", label, src, dest)
+        shutil.move(str(src), str(dest))
+        return
+    if src.is_file():
+        if dest.is_dir():
+            logger.warning("vision: 跳过%s缓存文件 %s，目标是目录 %s", label, src, dest)
+            return
+        logger.info("vision: %s缓存已存在 %s，删除旧文件 %s", label, dest, src)
+        try:
+            src.unlink()
+        except OSError as e:
+            logger.warning("vision: 删除旧%s缓存文件失败 %s: %s", label, src, e)
+        return
+    logger.info("vision: 合并%s缓存 %s -> %s", label, src, dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    for item in src.iterdir():
+        _move_tree(item, dest / item.name, label)
+    try:
+        src.rmdir()
+    except OSError:
+        pass
+
+
+def _prune_empty_dirs(path: Path, stop: Path) -> None:
+    current = path
+    while current != stop and current.exists():
+        try:
+            current.rmdir()
+        except OSError:
+            break
+        current = current.parent
+
+
+def _migrate_legacy_model_caches() -> None:
+    mappings = [
+        (
+            _legacy_cache_base() / "huggingface" / "hub" / "models--facebook--dinov2-small",
+            _hf_model_dir("facebook/dinov2-small"),
+            "HuggingFace",
+        ),
+        (
+            _legacy_cache_base() / "torch" / "hub" / "checkpoints" / "mobilenet_v2-7ebf99e0.pth",
+            _torch_home() / "hub" / "checkpoints" / "mobilenet_v2-7ebf99e0.pth",
+            "Torch",
+        ),
+        (
+            _legacy_cache_base() / "torch" / "hub" / "clip" / "RN50.pt",
+            _torch_home() / "hub" / "clip" / "RN50.pt",
+            "Torch",
+        ),
+        (
+            _legacy_cache_base() / "torch" / "hub" / "pyiqa",
+            _torch_home() / "hub" / "pyiqa",
+            "Torch",
+        ),
+        (_legacy_cache_base() / "pic_selecter" / "insightface", _insightface_root(), "InsightFace"),
+    ]
+    for src, dest, label in mappings:
+        try:
+            _move_tree(src, dest, label)
+        except Exception as e:
+            logger.warning("vision: 迁移%s缓存失败 %s -> %s: %s", label, src, dest, e)
+    _prune_empty_dirs(_legacy_cache_base() / "huggingface" / "hub" / "models--facebook--dinov2-small", _legacy_cache_base())
+    _prune_empty_dirs(_legacy_cache_base() / "torch" / "hub" / "checkpoints", _legacy_cache_base())
+    _prune_empty_dirs(_legacy_cache_base() / "torch" / "hub" / "clip", _legacy_cache_base())
+    _prune_empty_dirs(_legacy_cache_base() / "torch" / "hub" / "pyiqa", _legacy_cache_base())
+    _prune_empty_dirs(_legacy_cache_base() / "pic_selecter", _legacy_cache_base())
+
+
+def _ensure_model_storage_configured() -> None:
+    global _MODEL_STORAGE_READY
+    if _MODEL_STORAGE_READY:
+        return
+    with _LOCK:
+        if _MODEL_STORAGE_READY:
+            return
+        models_root = _cache_dir()
+        hf_home = _hf_home()
+        hf_hub_cache = _hf_hub_cache()
+        torch_home = _torch_home()
+        for path in (
+            models_root,
+            hf_home,
+            hf_hub_cache,
+            hf_home / "assets",
+            hf_home / "xet",
+            torch_home,
+            _insightface_root(),
+        ):
+            path.mkdir(parents=True, exist_ok=True)
+        os.environ["HF_HOME"] = str(hf_home)
+        os.environ["HUGGINGFACE_HUB_CACHE"] = str(hf_hub_cache)
+        os.environ["HF_HUB_CACHE"] = str(hf_hub_cache)
+        os.environ["HUGGINGFACE_ASSETS_CACHE"] = str(hf_home / "assets")
+        os.environ["TRANSFORMERS_CACHE"] = str(hf_hub_cache)
+        os.environ["HF_XET_CACHE"] = str(hf_home / "xet")
+        os.environ["TORCH_HOME"] = str(torch_home)
+        try:
+            import torch.hub
+            torch.hub.set_dir(str(torch_home / "hub"))
+        except Exception:
+            pass
+        if "pyiqa.utils.download_util" in sys.modules:
+            try:
+                import pyiqa.utils.download_util as download_util
+                download_util.DEFAULT_CACHE_DIR = os.path.join(str(torch_home / "hub"), "pyiqa")
+            except Exception:
+                pass
+        _migrate_legacy_model_caches()
+        _MODEL_STORAGE_READY = True
+        logger.info("vision: 模型目录已固定到 %s", models_root)
+
+
+def _pyiqa_device():
+    import torch
+    runtime = _runtime_preference()
+    forced = _env_choice("PIC_SELECTER_PYIQA_DEVICE", {"cpu", "cuda"})
+    if runtime == "cpu" and forced is None:
+        return torch.device("cpu")
+    if forced == "cuda":
+        if not torch.cuda.is_available():
+            raise VisionUnavailable("PIC_SELECTER_PYIQA_DEVICE=cuda，但当前 torch 不支持 CUDA。")
+        return torch.device("cuda")
+    if forced == "cpu":
+        return torch.device("cpu")
+    # MPS 上 pyiqa/CLIP patch embedding 极易炸显存，继续固定走 CPU。
+    if _device_type() == "cuda":
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def _create_pyiqa_metric(metric_name: str, label: str):
+    import pyiqa
+    import torch
+    dev = _pyiqa_device()
+    try:
+        model = pyiqa.create_metric(metric_name, device=dev, as_loss=False)
+        logger.info("vision: %s 就绪（device=%s）", label, dev.type)
+        return model, dev
+    except Exception as e:
+        if dev.type != "cuda":
+            raise
+        logger.warning("vision: %s CUDA 初始化失败，回退 CPU：%s", label, e)
+        cpu = torch.device("cpu")
+        model = pyiqa.create_metric(metric_name, device=cpu, as_loss=False)
+        logger.info("vision: %s 就绪（device=cpu）", label)
+        return model, cpu
+
+
+def _select_onnx_providers(available: list[str]) -> tuple[list[str], int]:
+    runtime = _runtime_preference()
+    forced = _env_choice("PIC_SELECTER_ONNX_PROVIDER", {"cpu", "cuda"})
+    if runtime == "cpu" and forced is None:
+        return ["CPUExecutionProvider"], -1
+    if runtime == "gpu" and forced is None:
+        forced = "cuda"
+    if forced == "cuda":
+        if "CUDAExecutionProvider" not in available:
+            raise VisionUnavailable(
+                "PIC_SELECTER_ONNX_PROVIDER=cuda，但当前 onnxruntime 不含 CUDAExecutionProvider。"
+            )
+        return ["CUDAExecutionProvider", "CPUExecutionProvider"], 0
+    if forced == "cpu":
+        return ["CPUExecutionProvider"], -1
+    if _device_type() == "cuda" and "CUDAExecutionProvider" in available:
+        return ["CUDAExecutionProvider", "CPUExecutionProvider"], 0
+    return ["CPUExecutionProvider"], -1
+
+
+def _prepare_onnxruntime() -> tuple[list[str], int]:
+    import torch  # noqa: F401  # 先 import torch，让 ORT 能复用其 CUDA/cuDNN DLL
+    import onnxruntime as ort
+    if hasattr(ort, "preload_dlls"):
+        try:
+            ort.preload_dlls()
+        except Exception as e:
+            logger.warning("vision: onnxruntime.preload_dlls() 失败，继续尝试默认加载：%s", e)
+    available = list(ort.get_available_providers())
+    providers, ctx_id = _select_onnx_providers(available)
+    logger.info("vision: ONNX Runtime providers 可用=%s，选用=%s", available, providers)
+    return providers, ctx_id
 
 
 # =============================================================
@@ -67,6 +340,7 @@ def _cache_dir() -> Path:
 # =============================================================
 
 def _ensure_dinov2():
+    _ensure_model_storage_configured()
     if "dinov2" in _models:
         return _models["dinov2"]
     with _LOCK:
@@ -83,14 +357,24 @@ def _ensure_dinov2():
         # 优先用本地缓存（HF 在国内常 SSL EOF；缓存命中时绕开 HEAD 校验）
         try:
             processor = AutoImageProcessor.from_pretrained(
-                "facebook/dinov2-small", local_files_only=True
+                "facebook/dinov2-small",
+                local_files_only=True,
+                cache_dir=str(_hf_hub_cache()),
             )
             model = AutoModel.from_pretrained(
-                "facebook/dinov2-small", local_files_only=True
+                "facebook/dinov2-small",
+                local_files_only=True,
+                cache_dir=str(_hf_hub_cache()),
             ).to(_device()).eval()
         except Exception:
-            processor = AutoImageProcessor.from_pretrained("facebook/dinov2-small")
-            model = AutoModel.from_pretrained("facebook/dinov2-small").to(_device()).eval()
+            processor = AutoImageProcessor.from_pretrained(
+                "facebook/dinov2-small",
+                cache_dir=str(_hf_hub_cache()),
+            )
+            model = AutoModel.from_pretrained(
+                "facebook/dinov2-small",
+                cache_dir=str(_hf_hub_cache()),
+            ).to(_device()).eval()
         _models["dinov2"] = (model, processor)
         logger.info("vision: DINOv2-small 就绪")
     return _models["dinov2"]
@@ -117,6 +401,7 @@ def extract_dinov2(pil_img: Image.Image) -> np.ndarray:
 # =============================================================
 
 def _ensure_nima():
+    _ensure_model_storage_configured()
     if "nima" in _models:
         return _models["nima"]
     with _LOCK:
@@ -168,12 +453,12 @@ def extract_aesthetic_score(pil_img: Image.Image) -> float:
 # =============================================================
 # pyiqa: MUSIQ（技术质量 0-100）+ CLIP-IQA+（LAION 美学 0-1）
 #
-# **关键：永远跑 CPU + 喂图前 resize 到 1024 长边。**
+# **关键：CUDA 优先，其它情况走 CPU + 喂图前 resize 到 1024 长边。**
 # 原因：pyiqa 的 MUSIQ / CLIP-IQA+ 内部不会自动下采样输入。Mac MPS 上喂
 # 4000 万像素的相机大图 → CLIP patch embedding 申请 34GiB buffer 直接爆。
-# 强制 CPU 避免 MPS OOM；输入 resize 到 1024 长边——MUSIQ 训练在多尺度
-# (384+) 上、CLIP-IQA 用 224×224，1024 远超模型需求，不损失评估精度，
-# 反而更快。
+# 因此 MPS 仍固定走 CPU；CUDA 则允许上独显。输入统一 resize 到 1024 长边——
+# MUSIQ 训练在多尺度 (384+) 上、CLIP-IQA 用 224×224，1024 远超模型需求，
+# 不损失评估精度，反而更快。
 # =============================================================
 
 PYIQA_MAX_SIDE = 1024
@@ -190,6 +475,7 @@ def _resize_for_pyiqa(pil_img: Image.Image) -> Image.Image:
 
 
 def _ensure_musiq():
+    _ensure_model_storage_configured()
     if "musiq" in _models:
         return _models["musiq"]
     with _LOCK:
@@ -202,16 +488,14 @@ def _ensure_musiq():
             raise VisionUnavailable(
                 f"MUSIQ 依赖缺失：{e}。需要 `pip install pyiqa timm`。"
             ) from e
-        logger.info("vision: 加载 MUSIQ（CPU，技术质量评分，首次约 100MB）…")
-        dev = torch.device("cpu")
-        model = pyiqa.create_metric("musiq", device=dev, as_loss=False)
+        logger.info("vision: 加载 MUSIQ（技术质量评分，首次约 100MB）…")
+        model, dev = _create_pyiqa_metric("musiq", "MUSIQ")
         _models["musiq"] = (model, dev)
-        logger.info("vision: MUSIQ 就绪")
     return _models["musiq"]
 
 
 def extract_musiq_score(pil_img: Image.Image) -> float:
-    """返回 MUSIQ 技术质量分 0-100。CPU + 1024 长边以下输入。"""
+    """返回 MUSIQ 技术质量分 0-100。输入限制在 1024 长边内。"""
     import torch
     model, _dev = _ensure_musiq()
     img = _resize_for_pyiqa(pil_img)
@@ -222,6 +506,7 @@ def extract_musiq_score(pil_img: Image.Image) -> float:
 
 
 def _ensure_clipiqa():
+    _ensure_model_storage_configured()
     if "clipiqa" in _models:
         return _models["clipiqa"]
     with _LOCK:
@@ -234,16 +519,14 @@ def _ensure_clipiqa():
             raise VisionUnavailable(
                 f"CLIP-IQA+ 依赖缺失：{e}。需要 `pip install pyiqa timm`。"
             ) from e
-        logger.info("vision: 加载 CLIP-IQA+（CPU，LAION 美学，首次约 350MB）…")
-        dev = torch.device("cpu")
-        model = pyiqa.create_metric("clipiqa+", device=dev, as_loss=False)
+        logger.info("vision: 加载 CLIP-IQA+（LAION 美学，首次约 350MB）…")
+        model, dev = _create_pyiqa_metric("clipiqa+", "CLIP-IQA+")
         _models["clipiqa"] = (model, dev)
-        logger.info("vision: CLIP-IQA+ 就绪")
     return _models["clipiqa"]
 
 
 def extract_clipiqa_score(pil_img: Image.Image) -> float:
-    """返回 CLIP-IQA+ 美学分 0-1。CPU + 1024 长边以下输入。"""
+    """返回 CLIP-IQA+ 美学分 0-1。输入限制在 1024 长边内。"""
     import torch
     model, _dev = _ensure_clipiqa()
     img = _resize_for_pyiqa(pil_img)
@@ -258,6 +541,7 @@ def extract_clipiqa_score(pil_img: Image.Image) -> float:
 # =============================================================
 
 def _ensure_insightface():
+    _ensure_model_storage_configured()
     if "insightface" in _models:
         return _models["insightface"]
     with _LOCK:
@@ -271,12 +555,25 @@ def _ensure_insightface():
             ) from e
 
         logger.info("vision: 加载 InsightFace（RetinaFace + ArcFace，首次约 300MB）…")
-        app = FaceAnalysis(
-            name="buffalo_l",
-            root=str(_cache_dir() / "insightface"),
-            providers=["CPUExecutionProvider"],
-        )
-        app.prepare(ctx_id=-1, det_size=(640, 640))
+        providers, ctx_id = _prepare_onnxruntime()
+        try:
+            app = FaceAnalysis(
+                name="buffalo_l",
+                root=str(_insightface_root()),
+                providers=providers,
+            )
+            app.prepare(ctx_id=ctx_id, det_size=(640, 640))
+        except Exception as e:
+            if providers and providers[0] == "CUDAExecutionProvider":
+                logger.warning("vision: InsightFace CUDA 初始化失败，回退 CPU：%s", e)
+                app = FaceAnalysis(
+                    name="buffalo_l",
+                    root=str(_insightface_root()),
+                    providers=["CPUExecutionProvider"],
+                )
+                app.prepare(ctx_id=-1, det_size=(640, 640))
+            else:
+                raise
         _models["insightface"] = app
         logger.info("vision: InsightFace 就绪")
     return _models["insightface"]
@@ -369,6 +666,7 @@ def compute_eye_open_score(face_info: dict, pil_img: Image.Image) -> float | Non
 
 def capabilities() -> dict:
     """轻量探测——仅尝试 import，不下载权重。"""
+    _ensure_model_storage_configured()
     out = {"dinov2": False, "aesthetic": False, "musiq": False,
            "clipiqa": False, "face_id": False}
     try:

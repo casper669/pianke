@@ -3,7 +3,7 @@ name: Build Tauri App
 on:
   push:
     branches:
-      - tauri-desktop
+      - main
     tags:
       - "v*"
   workflow_dispatch:

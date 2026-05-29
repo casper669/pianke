@@ -601,6 +601,25 @@ def scan_folder(folder: str) -> list[tuple[str, list[str]]]:
 
 # ---------------- 计算入口 ----------------
 
+def _default_expert_workers() -> int:
+    """CUDA 环境下允许少量并发，让 CPU 前处理与 GPU 推理重叠。"""
+    forced = os.getenv("PIC_SELECTER_EXPERT_WORKERS")
+    if forced:
+        try:
+            return max(1, min(int(forced), 8))
+        except ValueError:
+            pass
+    try:
+        from pic_selecter import vision
+        dev_type = vision._device_type()
+    except Exception:
+        dev_type = "cpu"
+    # MPS / CPU 仍保持单线程，避免历史上的稳定性问题。
+    if dev_type != "cuda":
+        return 1
+    return min(4, max(2, os.cpu_count() or 2))
+
+
 def compute_infos(
     folder: str,
     workers: Optional[int] = None,
@@ -671,13 +690,13 @@ def compute_infos(
 
     if needed:
         # 工作线程数：
-        # - expert：强制 1（torch MPS / InsightFace ONNX 多线程会段错误）
+        # - expert：CUDA 下给少量并发把 GPU 喂起来；MPS / CPU 仍保守单线程
         # - tycoon：用 ARK_MAX_WORKERS（默认 20）作为 ThreadPool 上限；
         #          实际并发由 llm_judge._LIMITER 自适应控制（起 10、触发限流减半）
         # - fast：纯 CPU + numpy/cv2，开 8 线程没问题
         if workers is None:
             if engine == "expert":
-                workers = 1
+                workers = _default_expert_workers()
             elif engine == "tycoon":
                 workers = int(os.getenv("ARK_MAX_WORKERS", "20"))
                 workers = max(1, min(workers, 32))
