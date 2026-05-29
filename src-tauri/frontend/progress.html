@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN" style="background:#f5f2ea">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>片刻 · 启动中</title>
+<link rel="stylesheet" href="css/style.css">
+<style>
+  .step-badge {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 3px 10px;
+    border-radius: 999px;
+    margin-left: 8px;
+    vertical-align: middle;
+  }
+  .step-install { background: var(--accent-soft); color: var(--accent-deep); }
+  .step-start  { background: var(--good-soft);  color: var(--good); }
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <div class="brand">
+    <div class="brand-mark"></div>
+    <div class="brand-text">片刻</div>
+  </div>
+
+  <div class="hero" id="hero-block">
+    <div class="sub" id="hero-label">启动中</div>
+    <h1 id="hero-title">正在启动<em>服务</em></h1>
+  </div>
+
+  <div class="card">
+    <div class="log-header">
+      <span class="dot-pulse" id="prog-dot"></span>
+      <span id="prog-title">等待中...</span>
+    </div>
+    <div class="log-view" id="log"></div>
+  </div>
+
+</div>
+
+<script>
+(function() {
+  'use strict';
+  var invoke = window.__TAURI_INTERNALS__.invoke;
+  var eventApi = window.__TAURI__ && window.__TAURI__.event;
+
+  function $(id) { return document.getElementById(id); }
+
+  function log(msg, cls) {
+    var el = $('log');
+    var line = document.createElement('div');
+    line.className = cls || '';
+    line.textContent = msg;
+    el.appendChild(line);
+    el.scrollTop = el.scrollHeight;
+  }
+
+  // 解析 URL 参数
+  var params = new URLSearchParams(window.location.search);
+  var modes = (params.get('modes') || '').split(',').filter(Boolean);
+  var runtime = params.get('runtime') || 'auto';
+
+  if (modes.length === 0) {
+    log('未指定安装模式，请返回重新选择', 'log-error');
+    $('prog-dot').style.display = 'none';
+    $('hero-title').innerHTML = '参数<em>错误</em>';
+  } else {
+    var flaskUrl = null;
+    var phaseSet = false;
+
+    function setPhase(phase) {
+      if (phaseSet) return;
+      phaseSet = true;
+      if (phase === 'install') {
+        $('hero-label').textContent = '安装依赖';
+        $('hero-title').innerHTML = '正在安装<em>依赖包</em>';
+        $('prog-title').textContent = '正在下载安装...';
+        document.title = '片刻 · 安装中';
+      } else {
+        $('hero-label').textContent = '启动服务';
+        $('hero-title').innerHTML = '正在启动<em>服务</em>';
+        $('prog-title').textContent = '正在启动 Flask...';
+      }
+    }
+
+    // 监听后台事件，根据第一条状态消息判断阶段
+    if (eventApi) {
+      eventApi.listen('setup:status', function(e) {
+        var msg = e.payload;
+        log(msg, 'log-status');
+        if (msg.indexOf('安装') !== -1) {
+          setPhase('install');
+        } else if (msg.indexOf('启动') !== -1 || msg.indexOf('就绪') !== -1) {
+          setPhase('start');
+        }
+      }).catch(function(){});
+
+      eventApi.listen('setup:progress', function(e) {
+        log(e.payload);
+      }).catch(function(){});
+
+      eventApi.listen('setup:error', function(e) {
+        log(e.payload, 'log-error');
+        $('prog-dot').style.display = 'none';
+      }).catch(function(){});
+
+      eventApi.listen('setup:ready', function(e) {
+        flaskUrl = e.payload;
+      }).catch(function(){});
+    }
+
+    // 启动
+    invoke('start_setup', { modes: modes, runtime: runtime }).catch(function(e) {
+      log('启动失败: ' + e, 'log-error');
+      $('prog-dot').style.display = 'none';
+    });
+
+    // 轮询 Flask，就绪后跳转（Rust 侧 navigate 的兜底）
+    var count = 0;
+    var pollUrl = 'http://localhost:5057';
+    var timer = setInterval(function() {
+      if (++count > 120) { clearInterval(timer); return; }
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', pollUrl, true);
+      xhr.timeout = 1000;
+      xhr.onload = function() {
+        if (xhr.status > 0) {
+          clearInterval(timer);
+          log('服务已就绪', 'log-status');
+          $('hero-label').textContent = '就绪';
+          $('hero-title').innerHTML = '正在进入<em>片刻</em>';
+          $('prog-dot').style.display = 'none';
+          var target = flaskUrl || pollUrl;
+          invoke('navigate_to_flask', { url: target }).catch(function(){});
+        }
+      };
+      xhr.onerror = function(){};
+      xhr.ontimeout = function(){};
+      try { xhr.send(); } catch(e) {}
+    }, 500);
+  }
+})();
+</script>
+</body>
+</html>
